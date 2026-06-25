@@ -1,0 +1,4 @@
+# configs/task/jump.yaml
+name: jump
+target_speed: 0.0
+max_steps: 500

@@ -1,0 +1,10 @@
+# configs/robot/h1.yaml
+# Unitree H1 humanoid
+
+name: h1
+mjcf_file: unitree_h1.xml
+default_torque_limit: 150.0
+min_torso_height: 0.6
+reset_noise_scale: 0.01
+kp: 200.0
+kd: 10.0

@@ -1,0 +1,26 @@
+# configs/train.yaml — Master Hydra config
+
+defaults:
+  - robot: humanoid     # "humanoid" | "h1"
+  - task: walk          # "walk" | "run" | "stair" | "jump"
+  - algo: ppo
+  - _self_
+
+# Training settings
+train:
+  total_steps: 10_000_000
+  use_gpu: true
+  save_every: 100       # save checkpoint every N updates
+  eval_every: 50        # evaluate every N updates
+
+# Environment settings
+env:
+  frame_skip: 5         # physics steps per control step (5 × 0.002s = 0.01s = 100Hz control)
+
+# Data collection settings (used by collect_data.py)
+collector:
+  n_episodes: 200
+  n_envs: 8
+  output_dir: data/raw
+  save_every: 50
+  policy_checkpoint: null   # set to use trained policy

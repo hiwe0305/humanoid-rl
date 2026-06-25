@@ -1,0 +1,4 @@
+# configs/task/walk.yaml
+name: walk
+target_speed: 1.0      # m/s
+max_steps: 1000

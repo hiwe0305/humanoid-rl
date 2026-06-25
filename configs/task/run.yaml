@@ -1,0 +1,4 @@
+# configs/task/run.yaml
+name: run
+target_speed: 3.0
+max_steps: 1000

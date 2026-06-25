@@ -1,0 +1,455 @@
+"""
+humanoid_rl/envs/mujoco/h1_env.py
+Unitree H1 Humanoid Environment — production-quality locomotion env.
+
+Key improvements over base env:
+  - PD position control (action = target joint positions)
+  - Terrain injection (stair, rough, slope, hurdle, gap)
+  - Domain randomization (mass, friction, damping, gear, pushes)
+  - Rich observation: qpos + qvel + body heights + contacts + prev_action
+  - Per-task reward weights (tuned for H1)
+  - Proprioceptive history (optional)
+"""
+from __future__ import annotations
+
+import mujoco
+import numpy as np
+from pathlib import Path
+from gymnasium import spaces
+from typing import Any
+
+from humanoid_rl.envs.base_env import BaseHumanoidEnv
+from humanoid_rl.envs.mujoco.pd_control import PDController
+from humanoid_rl.envs.mujoco.terrain import inject_terrain
+from humanoid_rl.envs.mujoco.domain_rand import DomainRandomizer, PushRandomizer
+from humanoid_rl.rewards.locomotion import LocomotionRewards
+from humanoid_rl.rewards.stability import StabilityRewards
+from humanoid_rl.rewards.energy import EnergyRewards
+
+
+# ─── H1 Physical Constants ────────────────────────────────────────────────────
+
+# Per-joint PD gains for Unitree H1 (tuned for stability)
+H1_KP = np.array([
+    # hip_yaw, hip_roll, hip_pitch, knee, ankle (×2 sides)
+    150.0, 150.0, 200.0, 200.0, 60.0,   # left leg
+    150.0, 150.0, 200.0, 200.0, 60.0,   # right leg
+    200.0,                               # torso
+    60.0,  60.0,  60.0,  60.0,          # left arm
+    60.0,  60.0,  60.0,  60.0,          # right arm
+], dtype=np.float32)
+
+H1_KD = np.array([
+    5.0,  5.0,  5.0,  5.0,  1.5,        # left leg
+    5.0,  5.0,  5.0,  5.0,  1.5,        # right leg
+    5.0,                                 # torso
+    1.5,  1.5,  1.5,  1.5,              # left arm
+    1.5,  1.5,  1.5,  1.5,              # right arm
+], dtype=np.float32)
+
+# Torque limits (Nm) for H1
+H1_TORQUE_LIMITS = np.array([
+    200.0, 200.0, 200.0, 300.0, 40.0,   # left leg
+    200.0, 200.0, 200.0, 300.0, 40.0,   # right leg
+    200.0,                               # torso
+    40.0,  40.0,  40.0,  40.0,          # left arm
+    40.0,  40.0,  40.0,  40.0,          # right arm
+], dtype=np.float32)
+
+# Default standing pose (radians) — slight knee bend for stability
+H1_DEFAULT_QPOS = np.array([
+    0.0, 0.0, -0.35,  0.70, -0.35,      # left leg: yaw, roll, hip_pitch, knee, ankle
+    0.0, 0.0, -0.35,  0.70, -0.35,      # right leg
+    0.0,                                  # torso
+    0.0, 0.3,  0.0,  0.3,               # left arm
+    0.0, -0.3, 0.0,  0.3,               # right arm
+], dtype=np.float32)
+
+# Action scale: max joint deviation from default (radians)
+H1_ACTION_SCALE = 0.4  # rad
+
+
+class H1Env(BaseHumanoidEnv):
+    """
+    Unitree H1 Humanoid Locomotion Environment.
+
+    Uses PD position control, terrain injection, and domain randomization.
+
+    Args:
+        task_cfg:         Task configuration dict (from task.to_cfg())
+        terrain_type:     "flat" | "stair" | "rough" | "slope" | "hurdle" | "gap"
+        terrain_kwargs:   Extra args for terrain generator
+        domain_rand_cfg:  Domain randomization config dict (None = disabled)
+        push_rand_cfg:    Push randomization config dict (None = disabled)
+        render_mode:      "human" | "rgb_array" | None
+        frame_skip:       Physics steps per control step (default 10 → 50Hz)
+        width, height:    Render resolution
+        history_len:      Proprioceptive history frames (1 = no history)
+    """
+
+    def __init__(
+        self,
+        task_cfg:        dict,
+        terrain_type:    str = "flat",
+        terrain_kwargs:  dict | None = None,
+        domain_rand_cfg: dict | None = None,
+        push_rand_cfg:   dict | None = None,
+        render_mode:     str | None = None,
+        frame_skip:      int = 10,
+        width:           int = 640,
+        height:          int = 480,
+        history_len:     int = 1,
+    ):
+        from humanoid_rl.robots.unitree_h1 import get_h1_cfg
+        robot_cfg = get_h1_cfg()
+
+        super().__init__(robot_cfg, task_cfg, render_mode, frame_skip)
+
+        self._width      = width
+        self._height     = height
+        self._history_len = history_len
+
+        # ── Load MuJoCo model with terrain ──────────────────────────────────
+        xml_path = robot_cfg["mjcf_path_absolute"]
+        xml_dir  = str(Path(xml_path).parent)
+
+        with open(xml_path, "r") as f:
+            base_xml = f.read()
+
+        # Fix asset paths to absolute so from_xml_string works
+        base_xml = base_xml.replace(
+            'meshdir="assets"',
+            f'meshdir="{xml_dir}/assets"'
+        ).replace(
+            'texturedir="assets"',
+            f'texturedir="{xml_dir}/assets"'
+        )
+
+        # Patch offscreen framebuffer — MUST happen before MjModel.from_xml_string
+        import re as _re
+        fb_size = max(width, height, 640)
+        visual_block = f'  <visual>\n    <global offwidth="{fb_size}" offheight="{fb_size}"/>\n  </visual>'
+        if _re.search(r'<visual\b', base_xml):
+            if 'offwidth' in base_xml:
+                base_xml = _re.sub(r'offwidth="\d+"', f'offwidth="{fb_size}"', base_xml)
+                base_xml = _re.sub(r'offheight="\d+"', f'offheight="{fb_size}"', base_xml)
+            else:
+                base_xml = _re.sub(
+                    r'(<visual[^>]*>)',
+                    r'\1\n    ' + f'<global offwidth="{fb_size}" offheight="{fb_size}"/>',
+                    base_xml
+                )
+        else:
+            base_xml = _re.sub(
+                r'(<mujoco[^>]*>)',
+                r'\1\n' + visual_block,
+                base_xml, count=1
+            )
+        terrain_xml = inject_terrain(
+            base_xml,
+            terrain_type,
+            **(terrain_kwargs or {})
+        )
+
+        if terrain_type == "flat":
+            # Even flat terrain needs patched XML for correct framebuffer
+            self._model = mujoco.MjModel.from_xml_string(terrain_xml)
+        else:
+            self._model = mujoco.MjModel.from_xml_string(terrain_xml)
+
+        self._data  = mujoco.MjData(self._model)
+
+        self._sim_dt  = self._model.opt.timestep
+        self._ctrl_dt = self._sim_dt * frame_skip
+
+        nu = self._model.nu
+        assert nu == 19, f"H1 should have 19 actuators, got {nu}"
+
+        # ── PD Controller ───────────────────────────────────────────────────
+        self._pd = PDController(
+            model        = self._model,
+            kp           = H1_KP,
+            kd           = H1_KD,
+            torque_limit = H1_TORQUE_LIMITS,
+            action_scale = H1_ACTION_SCALE,
+        )
+        self._pd.set_default_pose(
+            np.concatenate([np.zeros(7), H1_DEFAULT_QPOS])
+        )
+
+        # ── Domain Randomization ─────────────────────────────────────────────
+        self._domain_rand = None
+        self._push_rand   = None
+        if domain_rand_cfg is not None:
+            self._domain_rand = DomainRandomizer(self._model, domain_rand_cfg)
+        if push_rand_cfg is not None:
+            self._push_rand = PushRandomizer(push_rand_cfg)
+        self._rng = np.random.default_rng()
+
+        # ── Observation Space ────────────────────────────────────────────────
+        obs_dim = self._compute_obs_dim()
+        self._observation_space = spaces.Box(
+            low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32
+        )
+        self._action_space = spaces.Box(
+            low=-1.0, high=1.0, shape=(nu,), dtype=np.float32
+        )
+
+        # ── Body names (H1-specific) ─────────────────────────────────────────
+        self._torso_body  = "torso_link"
+        self._pelvis_body = "pelvis"
+        self._lfoot_body  = "left_ankle_link"
+        self._rfoot_body  = "right_ankle_link"
+
+        # ── Reward modules ───────────────────────────────────────────────────
+        reward_cfg = task_cfg.get("rewards", {})
+        self._loco_rewards   = LocomotionRewards(reward_cfg.get("locomotion", {}))
+        self._stab_rewards   = StabilityRewards(reward_cfg.get("stability", {}))
+        self._energy_rewards = EnergyRewards(reward_cfg.get("energy", {}))
+
+        # ── Task params ──────────────────────────────────────────────────────
+        self._max_steps    = task_cfg.get("max_steps", 1000)
+        self._target_speed = task_cfg.get("target_speed", 1.0)
+
+        # ── State ────────────────────────────────────────────────────────────
+        self._renderer  = None
+        self._viewer    = None
+        self._prev_action = np.zeros(nu, dtype=np.float32)
+        self._obs_history = None  # for history_len > 1
+
+        mujoco.mj_forward(self._model, self._data)
+        self._init_qpos = self._data.qpos.copy()
+        self._init_qvel = self._data.qvel.copy()
+
+    # ── Observation ──────────────────────────────────────────────────────────
+
+    def _compute_obs_dim(self) -> int:
+        """
+        H1 Observation (per frame):
+          qpos[2:]           = 24  (z + quat[4] + joints[19])
+          qvel               = 25
+          body_heights       = 4   (torso, pelvis, left_ankle, right_ankle z)
+          foot_contacts      = 2
+          prev_action        = 19
+          ─────────────────────────
+          per-frame total    = 74
+          × history_len      = 74 * history_len
+        """
+        nu = self._model.nu  # 19
+        per_frame = (
+            (self._model.nq - 2) +  # qpos: skip root x,y → 24
+            self._model.nv +         # qvel: 25
+            4 +                      # body heights
+            2 +                      # foot contacts
+            nu                       # prev_action
+        )
+        return per_frame * self._history_len
+
+    def _get_obs_frame(self) -> np.ndarray:
+        """Compute single observation frame."""
+        d = self._data
+
+        # Joint positions: skip x, y (indices 0,1) — keep z, quat, joints
+        qpos = d.qpos[2:].copy()  # [24]
+
+        # Joint velocities (all)
+        qvel = d.qvel.copy()      # [25]
+
+        # Relative joint positions from default
+        # (helps policy know how far it is from standing pose)
+        # qpos[-19:] - H1_DEFAULT_QPOS  ← already in qpos, don't add separately
+
+        # Body heights
+        torso_z  = float(self._get_body_z(self._torso_body))
+        pelvis_z = float(self._get_body_z(self._pelvis_body))
+        lfoot_z  = float(self._get_body_z(self._lfoot_body))
+        rfoot_z  = float(self._get_body_z(self._rfoot_body))
+        body_heights = np.array([torso_z, pelvis_z, lfoot_z, rfoot_z], dtype=np.float32)
+
+        # Foot contacts
+        contacts = self._get_foot_contacts()
+
+        # Previous action (proprioceptive)
+        prev_a = self._prev_action.copy()
+
+        return np.concatenate([qpos, qvel, body_heights, contacts, prev_a], dtype=np.float32)
+
+    def _get_obs(self) -> np.ndarray:
+        """Get full observation (with history if enabled)."""
+        frame = self._get_obs_frame()
+        if self._history_len == 1:
+            return frame
+        # Shift history and add new frame
+        if self._obs_history is None:
+            self._obs_history = np.tile(frame, (self._history_len, 1))
+        else:
+            self._obs_history = np.roll(self._obs_history, -1, axis=0)
+            self._obs_history[-1] = frame
+        return self._obs_history.flatten()
+
+    def _get_body_z(self, name: str) -> float:
+        try:
+            bid = mujoco.mj_name2id(self._model, mujoco.mjtObj.mjOBJ_BODY, name)
+            return float(self._data.xpos[bid, 2])
+        except Exception:
+            return 0.0
+
+    def _body_exists(self, name: str) -> bool:
+        try:
+            bid = mujoco.mj_name2id(self._model, mujoco.mjtObj.mjOBJ_BODY, name)
+            return bid >= 0
+        except Exception:
+            return False
+
+    def _get_body_pos(self, name: str) -> np.ndarray:
+        try:
+            bid = mujoco.mj_name2id(self._model, mujoco.mjtObj.mjOBJ_BODY, name)
+            return self._data.xpos[bid].copy()
+        except Exception:
+            return np.zeros(3, dtype=np.float32)
+
+    def _get_foot_contacts(self) -> np.ndarray:
+        contacts = np.zeros(2, dtype=np.float32)
+        for i in range(self._data.ncon):
+            c = self._data.contact[i]
+            g1 = mujoco.mj_id2name(self._model, mujoco.mjtObj.mjOBJ_GEOM, c.geom1) or ""
+            g2 = mujoco.mj_id2name(self._model, mujoco.mjtObj.mjOBJ_GEOM, c.geom2) or ""
+            both = (g1 + " " + g2).lower()
+            if "left"  in both and "ankle" in both: contacts[0] = 1.0
+            if "right" in both and "ankle" in both: contacts[1] = 1.0
+        return contacts
+
+    # ── Properties ───────────────────────────────────────────────────────────
+
+    @property
+    def observation_space(self): return self._observation_space
+
+    @property
+    def action_space(self): return self._action_space
+
+    @property
+    def dt(self): return self._ctrl_dt
+
+    @property
+    def model(self): return self._model
+
+    @property
+    def data(self): return self._data
+
+    # ── Physics step ─────────────────────────────────────────────────────────
+
+    def _step_simulation(self, action: np.ndarray) -> None:
+        """PD control: action = normalized joint offsets [-1,1] → torques."""
+        torques = self._pd.compute_torques(
+            action     = action,
+            q          = self._data.qpos,
+            dq         = self._data.qvel,
+            qpos_offset = 7,
+            qvel_offset = 6,
+        )
+        self._data.ctrl[:] = torques
+        for _ in range(self.frame_skip):
+            if self._push_rand is not None:
+                self._push_rand.step(self._model, self._data, self._rng)
+            mujoco.mj_step(self._model, self._data)
+
+        self._prev_action[:] = action
+
+    # ── Reward ───────────────────────────────────────────────────────────────
+
+    def _get_reward(self, action: np.ndarray) -> float:
+        state = self._build_state_dict(action)
+        r  = self._loco_rewards.compute(state)
+        r += self._stab_rewards.compute(state)
+        r += self._energy_rewards.compute(state)
+        return float(r)
+
+    def _build_state_dict(self, action: np.ndarray) -> dict:
+        d = self._data
+        try:
+            bid = mujoco.mj_name2id(self._model, mujoco.mjtObj.mjOBJ_BODY, self._torso_body)
+            upright_vec = d.xmat[bid].reshape(3, 3)[:, 2]
+        except Exception:
+            upright_vec = np.array([0.0, 0.0, 1.0])
+        return {
+            "root_vel":      d.qvel[:3].copy(),
+            "root_ang_vel":  d.qvel[3:6].copy(),
+            "torso_height":  float(self._get_body_z(self._torso_body)),
+            "upright_vec":   upright_vec,
+            "torques":       d.actuator_force.copy(),
+            "action":        action,
+            "target_speed":  self._target_speed,
+            "foot_contacts": self._get_foot_contacts(),
+            "alive":         not self._is_terminated(),
+        }
+
+    # ── Termination ──────────────────────────────────────────────────────────
+
+    def _is_terminated(self) -> bool:
+        torso_z = self._get_body_z(self._torso_body)
+        min_h   = self.robot_cfg.get("min_torso_height", 0.5)
+        if np.isnan(torso_z) or torso_z < min_h:
+            return True
+        if np.any(np.isnan(self._data.qpos)):
+            return True
+        return False
+
+    def _is_truncated(self) -> bool:
+        return self._step_count >= self._max_steps
+
+    def _get_info(self) -> dict[str, Any]:
+        return {
+            "torso_height":  float(self._get_body_z(self._torso_body)),
+            "x_velocity":    float(self._data.qvel[0]),
+            "y_velocity":    float(self._data.qvel[1]),
+            "foot_contacts": self._get_foot_contacts().tolist(),
+        }
+
+    # ── Reset ─────────────────────────────────────────────────────────────────
+
+    def _reset_model(self) -> np.ndarray:
+        noise = self.robot_cfg.get("reset_noise_scale", 0.01)
+        rng   = self.np_random
+
+        # Reset to slightly perturbed default standing pose
+        self._data.qpos[:] = self._init_qpos.copy()
+        self._data.qpos[7:] = H1_DEFAULT_QPOS + rng.uniform(-noise, noise, 19)
+        self._data.qvel[:] = self._init_qvel + rng.uniform(-noise * 0.1, noise * 0.1, self._model.nv)
+
+        # Domain randomization
+        if self._domain_rand is not None:
+            self._domain_rand.randomize(self._model, self._rng)
+
+        # Reset push state
+        if self._push_rand is not None:
+            self._push_rand.reset(self._data)
+
+        # Reset history
+        self._obs_history = None
+        self._prev_action[:] = 0.0
+
+        # Reset reward state
+        self._loco_rewards.reset()
+        self._energy_rewards.reset()
+
+        mujoco.mj_forward(self._model, self._data)
+        return self._get_obs()
+
+    # ── Render ────────────────────────────────────────────────────────────────
+
+    def render(self):
+        if self.render_mode == "human":
+            if self._viewer is None:
+                self._viewer = mujoco.viewer.launch_passive(self._model, self._data)
+            self._viewer.sync()
+        elif self.render_mode == "rgb_array":
+            if self._renderer is None:
+                self._renderer = mujoco.Renderer(self._model, self._height, self._width)
+            self._renderer.update_scene(self._data)
+            return self._renderer.render()
+
+    def close(self):
+        if self._viewer is not None:
+            self._viewer.close()
+            self._viewer = None
+        self._renderer = None

@@ -1,0 +1,4 @@
+# configs/task/stair.yaml
+name: stair
+target_speed: 0.5
+max_steps: 2000

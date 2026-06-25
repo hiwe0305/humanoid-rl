@@ -1,0 +1,10 @@
+# configs/robot/humanoid.yaml
+# MuJoCo built-in humanoid model
+
+name: humanoid
+mjcf_file: null            # uses built-in model
+default_torque_limit: 100.0
+min_torso_height: 0.8
+reset_noise_scale: 0.01
+kp: 100.0
+kd: 10.0

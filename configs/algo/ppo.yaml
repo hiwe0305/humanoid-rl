@@ -1,0 +1,29 @@
+# configs/algo/ppo.yaml
+# PPO hyperparameters
+
+# Rollout
+n_envs: 16              # parallel envs (SyncVecEnv for now, SubprocVecEnv for >32)
+n_steps: 2048           # steps per env per rollout
+batch_size: 512         # mini-batch size
+n_epochs: 10            # PPO epochs per rollout
+
+# Discount
+gamma: 0.99
+gae_lambda: 0.95
+
+# PPO clipping
+clip_coef: 0.2
+clip_value: true
+
+# Loss coefficients
+value_coef: 0.5
+entropy_coef: 0.005
+
+# Optimization
+lr: 3.0e-4
+max_grad_norm: 1.0
+lr_anneal: true
+
+# Network architecture (hidden layer sizes)
+actor_hidden: [512, 256, 128]
+critic_hidden: [512, 256, 128]
