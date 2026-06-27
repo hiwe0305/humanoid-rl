@@ -37,7 +37,7 @@ UNITREE_H1_CFG = {
     # H1 specs (nq=26, nv=25, nu=19)
     "dof":                  19,
     "default_torque_limit": 200.0,   # Nm (H1 has strong actuators)
-    "min_torso_height":     0.5,     # m — terminate if torso falls below
+    "min_torso_height":     0.3,     # m — real fall threshold for H1 (standing=1.06m)
     "reset_noise_scale":    0.01,
     # Body names (from MuJoCo Menagerie)
     "torso_body_name":      "torso_link",

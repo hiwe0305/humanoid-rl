@@ -69,15 +69,29 @@ class SyncVecEnv:
     def step(
         self, actions: np.ndarray
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, List[dict]]:
-        results = [env.step(actions[i]) for i, env in enumerate(self.envs)]
-        obs_l, rew_l, term_l, trunc_l, info_l = zip(*results)
-        return (
-            np.stack(obs_l,  axis=0),
-            np.array(rew_l,  dtype=np.float32),
-            np.array(term_l, dtype=bool),
-            np.array(trunc_l, dtype=bool),
-            list(info_l),
-        )
+        obs_out   = np.zeros((self.n_envs, self.obs_dim), dtype=np.float32)
+        rew_out   = np.zeros(self.n_envs, dtype=np.float32)
+        term_out  = np.zeros(self.n_envs, dtype=bool)
+        trunc_out = np.zeros(self.n_envs, dtype=bool)
+        info_out  = []
+
+        for i, env in enumerate(self.envs):
+            obs, reward, term, trunc, info = env.step(actions[i])
+            done = term or trunc
+
+            if done:
+                # Save terminal obs before reset (PPO may need it for bootstrap)
+                info["terminal_obs"] = obs
+                # Auto-reset: standard behavior in all major RL frameworks
+                obs, _ = env.reset()
+
+            obs_out[i]   = obs
+            rew_out[i]   = reward
+            term_out[i]  = term
+            trunc_out[i] = trunc
+            info_out.append(info)
+
+        return obs_out, rew_out, term_out, trunc_out, info_out
 
     def close(self) -> None:
         for env in self.envs:

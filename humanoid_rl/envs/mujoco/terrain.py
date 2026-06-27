@@ -178,15 +178,28 @@ def inject_terrain(base_xml: str, terrain_type: str, **kwargs) -> str:
     """
     Inject terrain XML into base MJCF string.
 
+    Always adds a ground plane + terrain geometry.
+    H1 Menagerie XML has no floor, so we must always add one.
+
     Args:
         base_xml:     full MJCF XML string
         terrain_type: terrain name
         **kwargs:     terrain parameters
 
     Returns:
-        Modified XML string with terrain injected before </worldbody>
+        Modified XML string with floor + terrain injected before </worldbody>
     """
     terrain_xml = get_terrain_xml(terrain_type, **kwargs)
-    if not terrain_xml:
-        return base_xml
-    return base_xml.replace("</worldbody>", f"{terrain_xml}\n  </worldbody>")
+
+    # Always add floor plane (H1 Menagerie XML has no floor)
+    floor_geom = (
+        '    <geom name="floor" type="plane" size="50 50 0.1" '
+        'rgba="0.75 0.75 0.75 1" contype="1" conaffinity="1" friction="0.8 0.1 0.1"/>'
+    )
+
+    inject = floor_geom
+    if terrain_xml:
+        inject = floor_geom + "\n" + terrain_xml
+
+    return base_xml.replace("</worldbody>", f"{inject}\n  </worldbody>")
+

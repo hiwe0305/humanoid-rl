@@ -25,48 +25,65 @@ from humanoid_rl.envs.mujoco.domain_rand import DomainRandomizer, PushRandomizer
 from humanoid_rl.rewards.locomotion import LocomotionRewards
 from humanoid_rl.rewards.stability import StabilityRewards
 from humanoid_rl.rewards.energy import EnergyRewards
+from humanoid_rl.rewards.gait import GaitRewards
 
 
 # ─── H1 Physical Constants ────────────────────────────────────────────────────
 
-# Per-joint PD gains for Unitree H1 (tuned for stability)
+# Per-joint PD gains for Unitree H1
+# Tuned for position control: kp creates restoring torque, kd damps oscillation.
+# H1 Menagerie model has joint damping=1.0 and armature=0.1.
+# These PD gains are applied ON TOP of model dynamics via data.ctrl (direct torque).
 H1_KP = np.array([
     # hip_yaw, hip_roll, hip_pitch, knee, ankle (×2 sides)
-    150.0, 150.0, 200.0, 200.0, 60.0,   # left leg
-    150.0, 150.0, 200.0, 200.0, 60.0,   # right leg
+    200.0, 200.0, 200.0, 200.0, 40.0,   # left leg
+    200.0, 200.0, 200.0, 200.0, 40.0,   # right leg
     200.0,                               # torso
-    60.0,  60.0,  60.0,  60.0,          # left arm
-    60.0,  60.0,  60.0,  60.0,          # right arm
+    40.0,  40.0,  18.0,  18.0,          # left arm  (match ctrlrange)
+    40.0,  40.0,  18.0,  18.0,          # right arm
 ], dtype=np.float32)
 
 H1_KD = np.array([
-    5.0,  5.0,  5.0,  5.0,  1.5,        # left leg
-    5.0,  5.0,  5.0,  5.0,  1.5,        # right leg
+    5.0,  5.0,  5.0,  5.0,  2.0,        # left leg
+    5.0,  5.0,  5.0,  5.0,  2.0,        # right leg
     5.0,                                 # torso
-    1.5,  1.5,  1.5,  1.5,              # left arm
-    1.5,  1.5,  1.5,  1.5,              # right arm
+    2.0,  2.0,  1.0,  1.0,              # left arm
+    2.0,  2.0,  1.0,  1.0,              # right arm
 ], dtype=np.float32)
 
-# Torque limits (Nm) for H1
+# Torque limits (Nm) — matched to H1 Menagerie actuator ctrlrange
+# MuJoCo clamps data.ctrl to actuator_ctrlrange, so these must not exceed it.
 H1_TORQUE_LIMITS = np.array([
     200.0, 200.0, 200.0, 300.0, 40.0,   # left leg
     200.0, 200.0, 200.0, 300.0, 40.0,   # right leg
     200.0,                               # torso
-    40.0,  40.0,  40.0,  40.0,          # left arm
-    40.0,  40.0,  40.0,  40.0,          # right arm
+    40.0,  40.0,  18.0,  18.0,          # left arm  (ctrlrange=±40,±40,±18,±18)
+    40.0,  40.0,  18.0,  18.0,          # right arm
 ], dtype=np.float32)
 
-# Default standing pose (radians) — slight knee bend for stability
+# Default standing pose (radians)
+# H1 Menagerie default is all-zeros at root_z=1.06 → natural upright stance.
+# We use near-zero joints for a natural standing posture.
+# Small arm angles keep arms at sides for visual clarity.
 H1_DEFAULT_QPOS = np.array([
-    0.0, 0.0, -0.35,  0.70, -0.35,      # left leg: yaw, roll, hip_pitch, knee, ankle
-    0.0, 0.0, -0.35,  0.70, -0.35,      # right leg
+    0.0, 0.0, 0.0, 0.0, 0.0,            # left leg: yaw, roll, hip_pitch, knee, ankle
+    0.0, 0.0, 0.0, 0.0, 0.0,            # right leg
     0.0,                                  # torso
-    0.0, 0.3,  0.0,  0.3,               # left arm
-    0.0, -0.3, 0.0,  0.3,               # right arm
+    0.0, 0.2, 0.0, 0.3,                 # left arm: slight spread + elbow bend
+    0.0, -0.2, 0.0, 0.3,                # right arm
 ], dtype=np.float32)
+
+# Root height: H1 default qpos has root at z=1.06 with ankle_link at z=0.086.
+# To place feet on floor: root_z = 1.06 - 0.086 + small_margin = 0.98
+H1_INIT_ROOT_Z = 0.98  # m
+
+# No forward lean needed — with straight legs, CoM is naturally over feet.
+# Quaternion: identity = [1, 0, 0, 0]
+H1_INIT_QUAT = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
 
 # Action scale: max joint deviation from default (radians)
-H1_ACTION_SCALE = 0.4  # rad
+# With kp=200 Nm/rad, 0.3 rad → 60 Nm max PD torque (within ctrlrange for legs)
+H1_ACTION_SCALE = 0.3  # rad
 
 
 class H1Env(BaseHumanoidEnv):
@@ -151,12 +168,7 @@ class H1Env(BaseHumanoidEnv):
             **(terrain_kwargs or {})
         )
 
-        if terrain_type == "flat":
-            # Even flat terrain needs patched XML for correct framebuffer
-            self._model = mujoco.MjModel.from_xml_string(terrain_xml)
-        else:
-            self._model = mujoco.MjModel.from_xml_string(terrain_xml)
-
+        self._model = mujoco.MjModel.from_xml_string(terrain_xml)
         self._data  = mujoco.MjData(self._model)
 
         self._sim_dt  = self._model.opt.timestep
@@ -206,6 +218,9 @@ class H1Env(BaseHumanoidEnv):
         self._loco_rewards   = LocomotionRewards(reward_cfg.get("locomotion", {}))
         self._stab_rewards   = StabilityRewards(reward_cfg.get("stability", {}))
         self._energy_rewards = EnergyRewards(reward_cfg.get("energy", {}))
+        # Gait rewards: only active if "gait" key present in task config
+        gait_cfg = reward_cfg.get("gait", None)
+        self._gait_rewards = GaitRewards(gait_cfg) if gait_cfg else None
 
         # ── Task params ──────────────────────────────────────────────────────
         self._max_steps    = task_cfg.get("max_steps", 1000)
@@ -309,14 +324,43 @@ class H1Env(BaseHumanoidEnv):
             return np.zeros(3, dtype=np.float32)
 
     def _get_foot_contacts(self) -> np.ndarray:
+        """
+        Return binary foot contact indicators using body-based approach.
+
+        H1 uses capsule geoms on ankle links (named e.g. 'id=42').
+        Contact geom IDs are resolved to their parent body, then matched
+        against left_ankle_link / right_ankle_link bodies.
+        """
         contacts = np.zeros(2, dtype=np.float32)
+
+        # Pre-resolve foot body IDs
+        if not hasattr(self, '_lfoot_bid'):
+            try:
+                self._lfoot_bid = mujoco.mj_name2id(
+                    self._model, mujoco.mjtObj.mjOBJ_BODY, self._lfoot_body)
+            except Exception:
+                self._lfoot_bid = -1
+            try:
+                self._rfoot_bid = mujoco.mj_name2id(
+                    self._model, mujoco.mjtObj.mjOBJ_BODY, self._rfoot_body)
+            except Exception:
+                self._rfoot_bid = -1
+
         for i in range(self._data.ncon):
             c = self._data.contact[i]
-            g1 = mujoco.mj_id2name(self._model, mujoco.mjtObj.mjOBJ_GEOM, c.geom1) or ""
-            g2 = mujoco.mj_id2name(self._model, mujoco.mjtObj.mjOBJ_GEOM, c.geom2) or ""
-            both = (g1 + " " + g2).lower()
-            if "left"  in both and "ankle" in both: contacts[0] = 1.0
-            if "right" in both and "ankle" in both: contacts[1] = 1.0
+            # Resolve geom → body
+            b1 = self._model.geom_bodyid[c.geom1]
+            b2 = self._model.geom_bodyid[c.geom2]
+            # One of the bodies must be floor (body 0 = world)
+            touching_ground = (b1 == 0 or b2 == 0)
+            other_body = b2 if b1 == 0 else b1
+
+            if touching_ground:
+                if other_body == self._lfoot_bid:
+                    contacts[0] = 1.0
+                elif other_body == self._rfoot_bid:
+                    contacts[1] = 1.0
+
         return contacts
 
     # ── Properties ───────────────────────────────────────────────────────────
@@ -362,6 +406,8 @@ class H1Env(BaseHumanoidEnv):
         r  = self._loco_rewards.compute(state)
         r += self._stab_rewards.compute(state)
         r += self._energy_rewards.compute(state)
+        if self._gait_rewards is not None:
+            r += self._gait_rewards.compute(state)
         return float(r)
 
     def _build_state_dict(self, action: np.ndarray) -> dict:
@@ -371,23 +417,51 @@ class H1Env(BaseHumanoidEnv):
             upright_vec = d.xmat[bid].reshape(3, 3)[:, 2]
         except Exception:
             upright_vec = np.array([0.0, 0.0, 1.0])
+
+        contacts = self._get_foot_contacts()
+
+        # Foot velocities (for gait reward: foot slip penalty)
+        def _foot_vel(body_name: str) -> np.ndarray:
+            try:
+                bid = mujoco.mj_name2id(self._model, mujoco.mjtObj.mjOBJ_BODY, body_name)
+                vel = np.zeros(6)
+                mujoco.mj_objectVelocity(
+                    self._model, d, mujoco.mjtObj.mjOBJ_BODY, bid, vel, 0
+                )
+                return vel[3:6]   # linear velocity (x,y,z)
+            except Exception:
+                return np.zeros(3)
+
         return {
-            "root_vel":      d.qvel[:3].copy(),
-            "root_ang_vel":  d.qvel[3:6].copy(),
-            "torso_height":  float(self._get_body_z(self._torso_body)),
-            "upright_vec":   upright_vec,
-            "torques":       d.actuator_force.copy(),
-            "action":        action,
-            "target_speed":  self._target_speed,
-            "foot_contacts": self._get_foot_contacts(),
-            "alive":         not self._is_terminated(),
+            "root_vel":       d.qvel[:3].copy(),
+            "root_ang_vel":   d.qvel[3:6].copy(),
+            "torso_height":   float(self._get_body_z(self._torso_body)),
+            "upright_vec":    upright_vec,
+            "torques":        d.actuator_force.copy(),
+            "action":         action,
+            "target_speed":   self._target_speed,
+            "foot_contacts":  contacts,
+            "alive":          not self._is_terminated(),
+            # Gait reward extras
+            "q_joints":       d.qpos[7:].copy(),       # [19] joint angles
+            "lfoot_z":        float(self._get_body_z(self._lfoot_body)),
+            "rfoot_z":        float(self._get_body_z(self._rfoot_body)),
+            "lfoot_contact":  bool(contacts[0] > 0.5),
+            "rfoot_contact":  bool(contacts[1] > 0.5),
+            "lfoot_vel":      _foot_vel(self._lfoot_body),
+            "rfoot_vel":      _foot_vel(self._rfoot_body),
+            "step_count":     self._step_count,
+            "vx":             float(d.qvel[0]),
         }
 
     # ── Termination ──────────────────────────────────────────────────────────
 
     def _is_terminated(self) -> bool:
         torso_z = self._get_body_z(self._torso_body)
-        min_h   = self.robot_cfg.get("min_torso_height", 0.5)
+        # H1 torso_link when standing: ~1.06m
+        # When crouching deeply: ~0.6m
+        # Terminate only on actual fall (< 0.3m) or NaN
+        min_h = self.robot_cfg.get("min_torso_height", 0.3)
         if np.isnan(torso_z) or torso_z < min_h:
             return True
         if np.any(np.isnan(self._data.qpos)):
@@ -413,6 +487,16 @@ class H1Env(BaseHumanoidEnv):
 
         # Reset to slightly perturbed default standing pose
         self._data.qpos[:] = self._init_qpos.copy()
+
+        # Set root height so feet contact floor
+        self._data.qpos[2] = H1_INIT_ROOT_Z
+
+        # Set root orientation (identity + small noise)
+        self._data.qpos[3:7] = H1_INIT_QUAT + rng.uniform(-0.005, 0.005, 4)
+        q = self._data.qpos[3:7]
+        self._data.qpos[3:7] = q / np.linalg.norm(q)
+
+        # Set joint positions to default + noise
         self._data.qpos[7:] = H1_DEFAULT_QPOS + rng.uniform(-noise, noise, 19)
         self._data.qvel[:] = self._init_qvel + rng.uniform(-noise * 0.1, noise * 0.1, self._model.nv)
 
@@ -430,10 +514,17 @@ class H1Env(BaseHumanoidEnv):
 
         # Reset reward state
         self._loco_rewards.reset()
+        self._stab_rewards = StabilityRewards(
+            self.task_cfg.get("rewards", {}).get("stability", {})
+        )
         self._energy_rewards.reset()
+        if self._gait_rewards is not None:
+            self._gait_rewards.reset()
 
         mujoco.mj_forward(self._model, self._data)
         return self._get_obs()
+
+
 
     # ── Render ────────────────────────────────────────────────────────────────
 

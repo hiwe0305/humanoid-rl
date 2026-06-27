@@ -13,14 +13,16 @@ class LocomotionRewards:
     Reward for forward locomotion behavior.
 
     Terms:
-        forward_vel:   reward matching target speed in x-direction
-        lateral_vel:   penalize lateral (y) drift
-        height_gain:   reward gaining height (stair/jump tasks)
-        vertical_vel:  reward upward velocity (jump tasks)
+        forward_vel:    reward matching target speed in x-direction
+        backward_pen:   STRONG penalty for backward motion (vx < 0)
+        lateral_vel:    penalize lateral (y) drift
+        height_gain:    reward gaining height (stair/jump tasks)
+        vertical_vel:   reward upward velocity (jump tasks)
     """
 
     def __init__(self, cfg: dict):
         self.forward_vel_weight   = cfg.get("forward_vel_weight",   2.0)
+        self.backward_penalty     = cfg.get("backward_penalty",     0.0)   # NEW
         self.lateral_vel_penalty  = cfg.get("lateral_vel_penalty",  0.5)
         self.height_gain_weight   = cfg.get("height_gain_weight",   0.0)
         self.vertical_vel_weight  = cfg.get("vertical_vel_weight",  0.0)
@@ -33,8 +35,14 @@ class LocomotionRewards:
 
         # Forward velocity reward: exponential kernel (smooth, bounded)
         vx = root_vel[0]
-        vel_error  = abs(vx - target_spd)
+        vel_error  = vx - target_spd
         reward += self.forward_vel_weight * np.exp(-vel_error ** 2)
+
+        # Backward motion penalty (CRITICAL for walk training)
+        # If vx < 0: penalty = backward_penalty × vx²
+        # Provides STRONG gradient signal to avoid walking backward
+        if self.backward_penalty > 0 and vx < 0:
+            reward -= self.backward_penalty * vx ** 2
 
         # Lateral velocity penalty
         vy = root_vel[1]

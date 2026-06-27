@@ -108,10 +108,16 @@ class BaseHumanoidEnv(gym.Env, abc.ABC):
         truncated  = self._is_truncated()
         info       = self._get_info()
 
-        self._step_count += 1
+        self._step_count    += 1
         self._episode_return += reward
-        info["step_count"]     = self._step_count
-        info["episode_return"] = self._episode_return
+        info["step_count"]   = self._step_count
+
+        # Only emit episode_return when episode is actually done.
+        # Previously emitted every step → PPO read running cumulative sum
+        # → ep_return in TensorBoard was 100× inflated.
+        if terminated or truncated:
+            info["episode_return"] = self._episode_return
+            info["episode_length"] = self._step_count
 
         return obs, reward, terminated, truncated, info
 

@@ -120,6 +120,13 @@ class PPOTrainer:
         self.logger     = Logger(log_dir)
         self.checkpoint = Checkpoint(str(self.log_dir / "checkpoints"))
 
+        # Reward normalization (running std)
+        self._normalize_reward = self.cfg.get("normalize_reward", False)
+        self._ret_rms_mean = 0.0
+        self._ret_rms_var  = 1.0
+        self._ret_rms_count = 0
+        self._ret_running   = np.zeros(self.cfg["n_envs"], dtype=np.float32)  # discounted return tracker
+
         # State
         self.global_step    = 0
         self.update_count   = 0
@@ -151,7 +158,11 @@ class PPOTrainer:
         print(f"[PPO] steps_per_update={steps_per_update:,}  n_envs={n_envs}")
         t_start = time.time()
 
-        while self.global_step < total_steps:
+        # Support resuming: count steps from 0 within this training run
+        # so `total_steps` is always interpreted as additional steps to train.
+        steps_trained_this_run = 0
+
+        while steps_trained_this_run < total_steps:
             # ── Collect rollout ───────────────────────────────────────────
             t_collect = time.time()
             self._collect_rollout()
@@ -163,7 +174,8 @@ class PPOTrainer:
             update_time = time.time() - t_update
 
             self.update_count += 1
-            self.global_step  += steps_per_update
+            self.global_step         += steps_per_update
+            steps_trained_this_run   += steps_per_update
 
             # ── Logging ───────────────────────────────────────────────────
             fps = steps_per_update / (collect_time + update_time)
@@ -218,6 +230,25 @@ class PPOTrainer:
 
             next_obs, rewards, terminated, truncated, infos = self.envs.step(actions_np)
             dones = (terminated | truncated).astype(np.float32)
+
+            # Reward normalization via running return std (Welford)
+            if self._normalize_reward:
+                gamma = self.cfg["gamma"]
+                self._ret_running = self._ret_running * gamma + rewards
+                # Update running stats
+                batch = self._ret_running
+                n = len(batch)
+                self._ret_rms_count += n
+                delta = batch.mean() - self._ret_rms_mean
+                self._ret_rms_mean += delta * n / self._ret_rms_count
+                self._ret_rms_var  = (
+                    (self._ret_rms_var * (self._ret_rms_count - n) + np.var(batch) * n)
+                    / self._ret_rms_count
+                )
+                ret_std = float(np.sqrt(self._ret_rms_var + 1e-8))
+                rewards = rewards / ret_std
+                # Reset running return on episode end
+                self._ret_running[dones > 0] = 0.0
 
             # Collect episode returns
             for i, (done, info) in enumerate(zip(dones, infos)):
