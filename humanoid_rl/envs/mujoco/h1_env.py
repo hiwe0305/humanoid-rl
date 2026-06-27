@@ -73,9 +73,10 @@ H1_DEFAULT_QPOS = np.array([
     0.0, -0.2, 0.0, 0.3,                # right arm
 ], dtype=np.float32)
 
-# Root height: H1 default qpos has root at z=1.06 with ankle_link at z=0.086.
-# To place feet on floor: root_z = 1.06 - 0.086 + small_margin = 0.98
-H1_INIT_ROOT_Z = 0.98  # m
+# Root height: Use H1 Menagerie default (1.06m).
+# At this height, feet start at z≈0.086m above floor and settle down via gravity
+# within the first few simulation steps, maintaining continuous foot contact.
+H1_INIT_ROOT_Z = 1.06  # m
 
 # No forward lean needed — with straight legs, CoM is naturally over feet.
 # Quaternion: identity = [1, 0, 0, 0]
