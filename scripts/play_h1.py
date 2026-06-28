@@ -191,14 +191,15 @@ class H1Controller:
         pitch_rate = data.qvel[4]
 
         # Horizontal stabilizing forces (PD on CoM position)
-        kp_h, kd_h = 800.0, 200.0
-        fx = np.clip(-(kp_h * dx + kd_h * dvx), -200, 200)
-        fy = np.clip(-(kp_h * dy + kd_h * dvy), -200, 200)
+        # Robot weight ~504N, CoM at 1m → need strong forces
+        kp_h, kd_h = 2000.0, 500.0
+        fx = np.clip(-(kp_h * dx + kd_h * dvx), -500, 500)
+        fy = np.clip(-(kp_h * dy + kd_h * dvy), -500, 500)
 
         # Angular stabilizing torques (PD on orientation)
-        kp_a, kd_a = 200.0, 50.0
-        tx = np.clip(-(kp_a * roll  + kd_a * roll_rate),  -100, 100)
-        ty = np.clip(-(kp_a * pitch + kd_a * pitch_rate), -100, 100)
+        kp_a, kd_a = 500.0, 100.0
+        tx = np.clip(-(kp_a * roll  + kd_a * roll_rate),  -200, 200)
+        ty = np.clip(-(kp_a * pitch + kd_a * pitch_rate), -200, 200)
 
         # Apply to pelvis: [torque_x, torque_y, torque_z, force_x, force_y, force_z]
         data.xfrc_applied[self.pelvis_id, :] = [tx, ty, 0, fx, fy, 0]
