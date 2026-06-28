@@ -246,10 +246,14 @@ class H1Env(BaseHumanoidEnv):
           qvel               = 25
           body_heights       = 4   (torso, pelvis, left_ankle, right_ankle z)
           foot_contacts      = 2
+          com_rel            = 2   (CoM x,y relative to support center)
+          com_vel            = 2   (CoM velocity x,y)
+          root_orient        = 2   (roll, pitch)
+          root_ang_vel       = 2   (roll_rate, pitch_rate)
           prev_action        = 19
           ─────────────────────────
-          per-frame total    = 74
-          × history_len      = 74 * history_len
+          per-frame total    = 82
+          × history_len      = 82 * history_len
         """
         nu = self._model.nu  # 19
         per_frame = (
@@ -257,6 +261,10 @@ class H1Env(BaseHumanoidEnv):
             self._model.nv +         # qvel: 25
             4 +                      # body heights
             2 +                      # foot contacts
+            2 +                      # com_rel (CoM relative to support center)
+            2 +                      # com_vel (CoM velocity)
+            2 +                      # root_orient (roll, pitch)
+            2 +                      # root_ang_vel (roll_rate, pitch_rate)
             nu                       # prev_action
         )
         return per_frame * self._history_len
@@ -271,10 +279,6 @@ class H1Env(BaseHumanoidEnv):
         # Joint velocities (all)
         qvel = d.qvel.copy()      # [25]
 
-        # Relative joint positions from default
-        # (helps policy know how far it is from standing pose)
-        # qpos[-19:] - H1_DEFAULT_QPOS  ← already in qpos, don't add separately
-
         # Body heights
         torso_z  = float(self._get_body_z(self._torso_body))
         pelvis_z = float(self._get_body_z(self._pelvis_body))
@@ -285,10 +289,58 @@ class H1Env(BaseHumanoidEnv):
         # Foot contacts
         contacts = self._get_foot_contacts()
 
+        # ── Balance observations ─────────────────────────────────────────
+        # CoM position relative to support center
+        com_rel, com_vel_xy = self._compute_com_state()
+        # Root orientation: roll & pitch from quaternion
+        qw, qx, qy, qz = d.qpos[3:7]
+        roll  = np.arctan2(2*(qw*qx + qy*qz), 1 - 2*(qx**2 + qy**2))
+        pitch = np.arctan2(2*(qw*qy - qz*qx), 1 - 2*(qx**2 + qy**2))
+        root_orient = np.array([roll, pitch], dtype=np.float32)
+        # Root angular velocity
+        root_ang_vel = np.array([d.qvel[3], d.qvel[4]], dtype=np.float32)  # roll_rate, pitch_rate
+
         # Previous action (proprioceptive)
         prev_a = self._prev_action.copy()
 
-        return np.concatenate([qpos, qvel, body_heights, contacts, prev_a], dtype=np.float32)
+        return np.concatenate([
+            qpos, qvel, body_heights, contacts,
+            com_rel, com_vel_xy, root_orient, root_ang_vel,
+            prev_a,
+        ], dtype=np.float32)
+
+    def _compute_com_state(self) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Compute center-of-mass position relative to support center
+        and CoM horizontal velocity.
+
+        Returns:
+            com_rel:    [com_x - sup_x, com_y - sup_y]  (2,)
+            com_vel_xy: [com_vx, com_vy]                 (2,)
+        """
+        m = self._model
+        d = self._data
+        com = np.zeros(3)
+        com_vel = np.zeros(3)
+        total_m = 0.0
+        for i in range(1, m.nbody):
+            mi = m.body_mass[i]
+            com += d.xipos[i] * mi
+            v6 = np.zeros(6)
+            mujoco.mj_objectVelocity(m, d, mujoco.mjtObj.mjOBJ_BODY, i, v6, 0)
+            com_vel += v6[3:6] * mi
+            total_m += mi
+        com /= total_m
+        com_vel /= total_m
+
+        # Support center (midpoint of ankles)
+        lank_pos = self._get_body_pos(self._lfoot_body)
+        rank_pos = self._get_body_pos(self._rfoot_body)
+        sup = (lank_pos + rank_pos) / 2.0
+
+        com_rel = np.array([com[0] - sup[0], com[1] - sup[1]], dtype=np.float32)
+        com_vel_xy = np.array([com_vel[0], com_vel[1]], dtype=np.float32)
+        return com_rel, com_vel_xy
 
     def _get_obs(self) -> np.ndarray:
         """Get full observation (with history if enabled)."""
@@ -433,6 +485,12 @@ class H1Env(BaseHumanoidEnv):
             except Exception:
                 return np.zeros(3)
 
+        # Balance state
+        com_rel, com_vel_xy = self._compute_com_state()
+        qw, qx, qy, qz = d.qpos[3:7]
+        roll  = float(np.arctan2(2*(qw*qx + qy*qz), 1 - 2*(qx**2 + qy**2)))
+        pitch = float(np.arctan2(2*(qw*qy - qz*qx), 1 - 2*(qx**2 + qy**2)))
+
         return {
             "root_vel":       d.qvel[:3].copy(),
             "root_ang_vel":   d.qvel[3:6].copy(),
@@ -443,6 +501,13 @@ class H1Env(BaseHumanoidEnv):
             "target_speed":   self._target_speed,
             "foot_contacts":  contacts,
             "alive":          not self._is_terminated(),
+            # Balance observations
+            "com_rel":        com_rel,          # [2] CoM relative to support center
+            "com_vel_xy":     com_vel_xy,       # [2] CoM horizontal velocity
+            "roll":           roll,
+            "pitch":          pitch,
+            "roll_rate":      float(d.qvel[3]),
+            "pitch_rate":     float(d.qvel[4]),
             # Gait reward extras
             "q_joints":       d.qpos[7:].copy(),       # [19] joint angles
             "lfoot_z":        float(self._get_body_z(self._lfoot_body)),
