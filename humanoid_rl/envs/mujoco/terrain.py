@@ -201,5 +201,29 @@ def inject_terrain(base_xml: str, terrain_type: str, **kwargs) -> str:
     if terrain_xml:
         inject = floor_geom + "\n" + terrain_xml
 
-    return base_xml.replace("</worldbody>", f"{inject}\n  </worldbody>")
+    result = base_xml.replace("</worldbody>", f"{inject}\n  </worldbody>")
+
+    # Ensure offscreen framebuffer is large enough for rendering.
+    # MuJoCo Menagerie's default is 640×480 which is too small for HD.
+    # The <visual> section MUST appear before <worldbody> in MuJoCo XML.
+    offwidth  = max(kwargs.get("offwidth",  1280), 1280)
+    offheight = max(kwargs.get("offheight", 720),  720)
+
+    import re
+    # Check for a standalone <visual> section (not class="visual" in defaults)
+    has_visual_section = bool(re.search(r'^\s*<visual\s*>', result, re.MULTILINE))
+
+    visual_line = f'  <visual>\n    <global offwidth="{offwidth}" offheight="{offheight}"/>\n  </visual>\n'
+
+    if not has_visual_section:
+        # Insert before <worldbody> (MuJoCo requires this ordering)
+        result = result.replace("<worldbody>", f"{visual_line}\n  <worldbody>")
+    elif "offwidth" not in result:
+        result = re.sub(
+            r'(^\s*<visual\s*>)',
+            rf'\1\n    <global offwidth="{offwidth}" offheight="{offheight}"/>',
+            result, count=1, flags=re.MULTILINE,
+        )
+
+    return result
 
