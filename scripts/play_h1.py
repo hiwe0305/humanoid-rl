@@ -2,30 +2,19 @@
 scripts/play_h1.py
 Interactive real-time MuJoCo controller for Unitree H1.
 
-Modes:
-  manual  — Keyboard velocity commands → PD joint control
-  policy  — Keyboard velocity commands → trained RL policy
+Uses direct MuJoCo control with:
+- PD joint position control
+- Virtual CoM stabilization force (simulates ZMP balance control)
+- CPG walking pattern
 
 Controls:
-  W / ↑    Forward  (+0.5 m/s)
-  S / ↓    Backward (-0.5 m/s)
-  A / ←    Turn left
-  D / →    Turn right
-  SPACE    Reset robot
-  R        Toggle recording
-  Q / ESC  Quit
+  W / ↑    Walk forward        S / ↓    Walk backward
+  A / ←    Turn left            D / →    Turn right
+  SPACE    Reset robot          Q / ESC  Quit
 
 Usage:
-    # Manual PD control (no trained model needed):
-    PYTHONPATH=. python scripts/play_h1.py --mode manual
-
-    # Policy inference (requires checkpoint):
-    PYTHONPATH=. python scripts/play_h1.py --mode policy \\
-        --checkpoint runs/h1_walk_full/checkpoints/checkpoint_final.pt
-
-    # Record video while playing:
-    PYTHONPATH=. MUJOCO_GL=egl python scripts/play_h1.py --mode manual \\
-        --record --output h1_play.mp4
+    PYTHONPATH=. MUJOCO_GL=glfw python scripts/play_h1.py
+    PYTHONPATH=. MUJOCO_GL=egl  python scripts/play_h1.py --offscreen
 """
 from __future__ import annotations
 
@@ -38,511 +27,349 @@ sys.path.insert(0, str(Path(__file__).parents[1]))
 import numpy as np
 import mujoco
 import mujoco.viewer
+from robot_descriptions import h1_mj_description
 
-from humanoid_rl.envs.mujoco.h1_env import (
-    H1Env, H1_DEFAULT_QPOS, H1_KP, H1_KD, H1_TORQUE_LIMITS,
-    H1_INIT_ROOT_Z, H1_INIT_QUAT, H1_ACTION_SCALE,
-)
-from humanoid_rl.envs.mujoco.tasks.walk_task import WalkTask
-from humanoid_rl.envs.mujoco.tasks.stand_task import StandTask
+from humanoid_rl.envs.mujoco.terrain import inject_terrain
 
 
-# ─── Keyboard State ──────────────────────────────────────────────────────────
+# ─── Joint layout (19 actuators) ─────────────────────────────────────────────
+#  0: left_hip_yaw      5: right_hip_yaw     10: torso
+#  1: left_hip_roll     6: right_hip_roll     11-14: left arm
+#  2: left_hip_pitch    7: right_hip_pitch    15-18: right arm
+#  3: left_knee         8: right_knee
+#  4: left_ankle        9: right_ankle
 
-class KeyboardState:
-    """Track pressed keys for velocity command generation."""
+# PD gains
+KP = np.array([
+    200, 200, 200, 300, 40,   # left leg
+    200, 200, 200, 300, 40,   # right leg
+    200,                       # torso
+    40, 40, 18, 18,            # left arm
+    40, 40, 18, 18,            # right arm
+], dtype=np.float64)
 
+KD = np.array([
+    5, 5, 8, 10, 2,
+    5, 5, 8, 10, 2,
+    5,
+    2, 2, 1, 1,
+    2, 2, 1, 1,
+], dtype=np.float64)
+
+# Default standing pose
+Q_DEFAULT = np.zeros(19, dtype=np.float64)
+Q_DEFAULT[3]  = 0.05    # left knee (very slight bend)
+Q_DEFAULT[8]  = 0.05    # right knee
+Q_DEFAULT[12] = 0.2     # left shoulder roll
+Q_DEFAULT[16] = -0.2    # right shoulder roll
+Q_DEFAULT[14] = 0.3     # left elbow
+Q_DEFAULT[18] = 0.3     # right elbow
+
+ROOT_Z = 1.06
+
+
+# ─── Keyboard ────────────────────────────────────────────────────────────────
+
+class KeyState:
     def __init__(self):
-        self.forward  = False
-        self.backward = False
-        self.left     = False
-        self.right    = False
-        self.reset_requested = False
-        self.quit_requested  = False
-        self.recording       = False
+        self.fwd = self.bwd = self.left = self.right = False
+        self.reset = self.quit = False
 
     @property
-    def cmd_vx(self) -> float:
-        """Target forward velocity (m/s)."""
-        vx = 0.0
-        if self.forward:  vx += 1.0
-        if self.backward: vx -= 0.5
-        return vx
+    def vx(self):
+        return (1.0 if self.fwd else 0.0) + (-0.5 if self.bwd else 0.0)
 
     @property
-    def cmd_vy(self) -> float:
-        """Target lateral velocity (m/s)."""
-        return 0.0
-
-    @property
-    def cmd_yaw(self) -> float:
-        """Target yaw rate (rad/s)."""
-        yaw = 0.0
-        if self.left:  yaw += 0.5
-        if self.right: yaw -= 0.5
-        return yaw
+    def yaw(self):
+        return (0.5 if self.left else 0.0) + (-0.5 if self.right else 0.0)
 
 
-def key_callback(keycode: int, state: KeyboardState):
-    """MuJoCo viewer key callback — updates keyboard state."""
-    # MuJoCo key codes
-    KEY_W     = 87
-    KEY_S     = 83
-    KEY_A     = 65
-    KEY_D     = 68
-    KEY_UP    = 265
-    KEY_DOWN  = 267
-    KEY_LEFT  = 263
-    KEY_RIGHT = 262
-    KEY_SPACE = 32
-    KEY_R     = 82
-    KEY_Q     = 81
-    KEY_ESC   = 256
-
-    if keycode == KEY_W or keycode == KEY_UP:
-        state.forward = not state.forward
-    elif keycode == KEY_S or keycode == KEY_DOWN:
-        state.backward = not state.backward
-    elif keycode == KEY_A or keycode == KEY_LEFT:
-        state.left = not state.left
-    elif keycode == KEY_D or keycode == KEY_RIGHT:
-        state.right = not state.right
-    elif keycode == KEY_SPACE:
-        state.reset_requested = True
-    elif keycode == KEY_R:
-        state.recording = not state.recording
-    elif keycode == KEY_Q or keycode == KEY_ESC:
-        state.quit_requested = True
+def make_key_cb(ks):
+    def cb(keycode):
+        if keycode in (87, 265):   ks.fwd = not ks.fwd
+        elif keycode in (83, 267): ks.bwd = not ks.bwd
+        elif keycode in (65, 263): ks.left = not ks.left
+        elif keycode in (68, 262): ks.right = not ks.right
+        elif keycode == 32:        ks.reset = True
+        elif keycode in (81, 256): ks.quit = True
+    return cb
 
 
-# ─── Manual PD Controller ────────────────────────────────────────────────────
+# ─── Controller ──────────────────────────────────────────────────────────────
 
-class ManualController:
-    """
-    Generates joint targets from velocity commands using simple heuristics.
+class H1Controller:
+    """Balance + walking controller for H1."""
 
-    This is NOT a proper walking controller — it's a manual tool for testing.
-    For real walking, train an RL policy.
-    """
-
-    def __init__(self, model: mujoco.MjModel):
+    def __init__(self, model):
         self.model = model
-        self.nu    = model.nu
-        self._phase = 0.0
-        self._freq  = 2.0  # Hz — step frequency
-
-        # PD controller targets (joint-space)
-        self.q_target = H1_DEFAULT_QPOS.copy()
-
-    def compute_action(self, data: mujoco.MjData,
-                       cmd_vx: float, cmd_yaw: float,
-                       dt: float) -> np.ndarray:
-        """
-        Convert velocity command to normalized action [-1, 1].
-
-        Strategy:
-        - cmd_vx = 0: hold default standing pose
-        - cmd_vx > 0: generate simple walking pattern (sinusoidal leg swing)
-        - cmd_yaw: add hip yaw offset for turning
-        """
-        action = np.zeros(self.nu, dtype=np.float32)
-
-        if abs(cmd_vx) < 0.05 and abs(cmd_yaw) < 0.05:
-            # Standing: zero action → PD holds default pose
-            return action
-
-        # Walking: generate a simple CPG-like pattern
-        self._phase += dt * self._freq * 2 * np.pi
-        phase = self._phase
-
-        # Amplitude scales with speed
-        amp = np.clip(abs(cmd_vx) * 0.5, 0.0, 0.8)
-        sign = 1.0 if cmd_vx >= 0 else -1.0
-
-        # Left leg (indices 0-4): hip_yaw, hip_roll, hip_pitch, knee, ankle
-        # Right leg (indices 5-9): same, anti-phase
-        sin_l = np.sin(phase)
-        sin_r = np.sin(phase + np.pi)  # anti-phase
-
-        # Hip pitch: swing legs forward/backward
-        action[2] = sign * amp * sin_l * 0.8       # left hip_pitch
-        action[7] = sign * amp * sin_r * 0.8       # right hip_pitch
-
-        # Knee: bend during swing phase
-        action[3] = abs(sin_l) * amp * 0.6          # left knee
-        action[8] = abs(sin_r) * amp * 0.6          # right knee
-
-        # Ankle: plantarflex during push-off
-        action[4] = -sin_l * amp * 0.3              # left ankle
-        action[9] = -sin_r * amp * 0.3              # right ankle
-
-        # Yaw: turn by offsetting hip yaw
-        if abs(cmd_yaw) > 0.05:
-            yaw_offset = cmd_yaw * 0.3
-            action[0] += yaw_offset   # left hip yaw
-            action[5] -= yaw_offset   # right hip yaw
-
-        # Arm swing (natural counter-rotation)
-        action[11] = -sign * amp * sin_l * 0.3   # left shoulder pitch
-        action[15] = -sign * amp * sin_r * 0.3   # right shoulder pitch
-
-        return np.clip(action, -1.0, 1.0)
-
-
-# ─── Policy Loader ────────────────────────────────────────────────────────────
-
-def load_policy(checkpoint_path: str, obs_dim: int, act_dim: int, device: str = "cpu"):
-    """Load trained ActorCritic from checkpoint."""
-    import torch
-    from humanoid_rl.algorithms.ppo.actor_critic import ActorCritic
-
-    state = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    cfg   = state.get("cfg", {})
-
-    ac = ActorCritic(
-        obs_dim       = obs_dim,
-        act_dim       = act_dim,
-        actor_hidden  = cfg.get("actor_hidden",  [512, 256, 128]),
-        critic_hidden = cfg.get("critic_hidden", [512, 256, 128]),
-    ).to(device)
-    ac.load_state_dict(state["ac_state"])
-    ac.eval()
-
-    global_step = state.get("global_step", 0)
-    print(f"  [Policy] Loaded — global_step={global_step:,}  device={device}")
-    return ac
-
-
-def policy_action(ac, obs: np.ndarray, device: str = "cpu") -> np.ndarray:
-    """Get deterministic action from policy."""
-    import torch
-    with torch.no_grad():
-        obs_t    = torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
-        obs_norm = ac.normalize_obs(obs_t)
-        action   = ac.actor(obs_norm).clamp(-1.0, 1.0)
-    return action.squeeze(0).cpu().numpy()
-
-
-# ─── Main Loop ────────────────────────────────────────────────────────────────
-
-def run_interactive(
-    mode:            str  = "manual",
-    checkpoint_path: str  | None = None,
-    record:          bool = False,
-    output:          str  = "h1_play.mp4",
-    max_steps:       int  = 10000,
-    fps:             int  = 50,
-):
-    """Run interactive MuJoCo viewer with H1 robot."""
-
-    # Create environment
-    task_cfg = WalkTask(target_speed=1.0, max_steps=max_steps).to_cfg()
-    env = H1Env(
-        task_cfg     = task_cfg,
-        terrain_type = "flat",
-        frame_skip   = 10,
-        width        = 960,
-        height       = 540,
-    )
-
-    obs_dim = env.observation_space.shape[0]
-    act_dim = env.action_space.shape[0]
-
-    print(f"{'='*60}")
-    print(f"  Unitree H1 — Interactive Controller")
-    print(f"  Mode: {mode.upper()}")
-    print(f"  obs_dim={obs_dim}  act_dim={act_dim}")
-    if checkpoint_path:
-        print(f"  Checkpoint: {checkpoint_path}")
-    print(f"{'='*60}")
-    print()
-    print("  Controls:")
-    print("    W/↑ = Forward    S/↓ = Backward")
-    print("    A/← = Turn Left  D/→ = Turn Right")
-    print("    SPACE = Reset    Q/ESC = Quit")
-    if record:
-        print("    R = Toggle Recording")
-    print()
-
-    # Load policy if needed
-    ac = None
-    device = "cpu"
-    if mode == "policy":
-        if checkpoint_path and Path(checkpoint_path).exists():
-            import torch
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-            ac = load_policy(checkpoint_path, obs_dim, act_dim, device)
-        else:
-            print("[WARNING] No valid checkpoint — falling back to manual mode")
-            mode = "manual"
-
-    # Manual controller
-    manual_ctrl = ManualController(env.model)
-    ctrl_dt = env.model.opt.timestep * env.frame_skip  # control dt
-
-    # Keyboard state
-    kb = KeyboardState()
-
-    # Recording
-    frames = []
-    renderer = None
-    if record:
-        renderer = mujoco.Renderer(env.model, 540, 960)
-
-    # Reset environment
-    obs, info = env.reset(seed=42)
-    total_reward = 0.0
-    ep_count = 0
-    step_count = 0
-
-    print(f"[Play] Launching MuJoCo viewer...")
-    print(f"[Play] Close window or press Q to exit.\n")
-
-    with mujoco.viewer.launch_passive(
-        env.model, env.data,
-        key_callback=lambda keycode: key_callback(keycode, kb),
-    ) as viewer:
-        # Set initial camera
-        viewer.cam.azimuth   = 135
-        viewer.cam.elevation = -20
-        viewer.cam.distance  = 4.0
-        viewer.cam.lookat[:] = [0.0, 0.0, 0.9]
-
-        t_start = time.time()
-        t_step  = t_start
-
-        while viewer.is_running() and not kb.quit_requested:
-            # Handle reset
-            if kb.reset_requested:
-                obs, info = env.reset(seed=42 + ep_count)
-                total_reward = 0.0
-                step_count = 0
-                ep_count += 1
-                manual_ctrl._phase = 0.0
-                kb.reset_requested = False
-                print(f"[Reset] Episode {ep_count}")
-
-            # Generate action
-            if mode == "policy" and ac is not None:
-                action = policy_action(ac, obs, device)
-            else:
-                action = manual_ctrl.compute_action(
-                    env.data, kb.cmd_vx, kb.cmd_yaw, ctrl_dt)
-
-            # Step environment
-            obs, reward, term, trunc, info = env.step(action)
-            total_reward += reward
-            step_count += 1
-
-            # Track camera to robot
-            rx = float(env.data.qpos[0])
-            ry = float(env.data.qpos[1])
-            viewer.cam.lookat[0] = rx
-            viewer.cam.lookat[1] = ry
-
-            # Record frame if recording
-            if record and kb.recording and renderer is not None:
-                cam = mujoco.MjvCamera()
-                cam.type = mujoco.mjtCamera.mjCAMERA_FREE
-                cam.azimuth   = viewer.cam.azimuth
-                cam.elevation = viewer.cam.elevation
-                cam.distance  = viewer.cam.distance
-                cam.lookat[:] = viewer.cam.lookat
-                renderer.update_scene(env.data, camera=cam)
-                frames.append(renderer.render().copy())
-
-            # Print periodic status
-            if step_count % 100 == 0:
-                vx = info.get("x_velocity", 0.0)
-                tz = info.get("torso_height", 0.0)
-                cmd = f"cmd_vx={kb.cmd_vx:.1f}"
-                rec_str = " [REC]" if kb.recording else ""
-                print(f"  step={step_count:5d} vx={vx:+6.2f} torso_z={tz:.3f} "
-                      f"reward={total_reward:+8.1f} {cmd}{rec_str}")
-
-            # Auto-reset on termination
-            if term or trunc:
-                vx = info.get("x_velocity", 0.0)
-                tz = info.get("torso_height", 0.0)
-                print(f"  [DONE] step={step_count} torso_z={tz:.3f} "
-                      f"vx={vx:.2f} total_r={total_reward:.1f}")
-                obs, info = env.reset(seed=42 + ep_count)
-                total_reward = 0.0
-                step_count = 0
-                ep_count += 1
-                manual_ctrl._phase = 0.0
-
-            # Sync viewer
-            viewer.sync()
-
-            # Real-time pacing
-            t_now = time.time()
-            t_elapsed = t_now - t_step
-            t_target = ctrl_dt
-            if t_elapsed < t_target:
-                time.sleep(t_target - t_elapsed)
-            t_step = time.time()
-
-    env.close()
-
-    # Save recorded video
-    if frames:
-        import imageio
-        out_path = Path(output)
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        imageio.mimwrite(str(out_path), frames, fps=fps, quality=8,
-                         macro_block_size=1)
-        print(f"\n[Play] Video saved: {out_path} ({len(frames)} frames)")
-
-    elapsed = time.time() - t_start
-    print(f"\n[Play] Session ended. {ep_count} episodes, {elapsed:.0f}s total.")
-
-
-# ─── Offscreen Video Mode ────────────────────────────────────────────────────
-
-def run_offscreen(
-    mode:            str  = "manual",
-    checkpoint_path: str  | None = None,
-    output:          str  = "h1_play.mp4",
-    n_steps:         int  = 1000,
-    fps:             int  = 50,
-    width:           int  = 960,
-    height:          int  = 540,
-):
-    """Record offscreen video (no display needed)."""
-    import imageio
-
-    task_cfg = WalkTask(target_speed=1.0, max_steps=n_steps).to_cfg()
-    env = H1Env(
-        task_cfg     = task_cfg,
-        terrain_type = "flat",
-        frame_skip   = 10,
-        width        = width,
-        height       = height,
-    )
-
-    obs_dim = env.observation_space.shape[0]
-    act_dim = env.action_space.shape[0]
-
-    # Load policy
-    ac = None
-    device = "cpu"
-    if mode == "policy" and checkpoint_path and Path(checkpoint_path).exists():
-        import torch
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        ac = load_policy(checkpoint_path, obs_dim, act_dim, device)
-
-    renderer = mujoco.Renderer(env.model, height, width)
-    cam = mujoco.MjvCamera()
-    cam.type      = mujoco.mjtCamera.mjCAMERA_FREE
-    cam.azimuth   = 135
-    cam.elevation = -20
-    cam.distance  = 4.0
-    cam.lookat[:] = [0.0, 0.0, 0.9]
-
-    obs, _ = env.reset(seed=42)
-    ctrl_dt = env.model.opt.timestep * env.frame_skip
-
-    # For manual mode: simulate walking forward
-    manual_ctrl = ManualController(env.model)
-
-    frames = []
-    total_r = 0.0
-
-    print(f"[Record] Recording {n_steps} steps → {output}")
-    for step in range(n_steps):
-        if ac is not None:
-            action = policy_action(ac, obs, device)
-        else:
-            # Simulate forward walking command
-            action = manual_ctrl.compute_action(env.data, 1.0, 0.0, ctrl_dt)
-
-        obs, reward, term, trunc, info = env.step(action)
-        total_r += reward
-
-        # Track camera
-        cam.lookat[0] = float(env.data.qpos[0])
-
-        renderer.update_scene(env.data, camera=cam)
-        frames.append(renderer.render().copy())
-
-        if term or trunc:
-            print(f"  [DONE] step={step} torso_z={info['torso_height']:.3f} "
-                  f"vx={info['x_velocity']:.2f} reward={total_r:.1f}")
-            obs, _ = env.reset(seed=42 + step)
-            total_r = 0.0
-
-    env.close()
-
-    out_path = Path(output)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    imageio.mimwrite(str(out_path), frames, fps=fps, quality=8,
-                     macro_block_size=1)
-    size_mb = out_path.stat().st_size / 1024 / 1024
-    print(f"[Record] ✅ Saved: {out_path} ({len(frames)} frames, {size_mb:.1f} MB)")
-
-
-# ─── CLI ──────────────────────────────────────────────────────────────────────
+        self.nu = model.nu
+
+        # Body IDs
+        self.pelvis_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "pelvis")
+        self.torso_id  = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "torso_link")
+        self.lankle_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "left_ankle_link")
+        self.rankle_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "right_ankle_link")
+
+        self.total_mass = sum(model.body_mass[i] for i in range(1, model.nbody))
+        self.g = abs(model.opt.gravity[2])
+
+        # Walking state
+        self.phase = 0.0
+        self.freq = 1.8
+
+    def step(self, data, cmd_vx, cmd_yaw, dt):
+        """Compute PD torques + balance forces and apply them."""
+
+        # ── 1. Walking target ────────────────────────────────────
+        q_target = Q_DEFAULT.copy()
+
+        if abs(cmd_vx) > 0.05 or abs(cmd_yaw) > 0.05:
+            self.phase += dt * self.freq * 2 * np.pi
+            amp = np.clip(abs(cmd_vx) * 0.35, 0.0, 0.45)
+            sgn = 1.0 if cmd_vx >= 0 else -1.0
+
+            sl = np.sin(self.phase)
+            sr = np.sin(self.phase + np.pi)
+
+            q_target[2] += sgn * amp * sl * 0.5    # L hip pitch
+            q_target[7] += sgn * amp * sr * 0.5    # R hip pitch
+            q_target[3] += max(0, sl) * amp * 0.35  # L knee
+            q_target[8] += max(0, sr) * amp * 0.35  # R knee
+            q_target[4] += -sl * amp * 0.15          # L ankle
+            q_target[9] += -sr * amp * 0.15          # R ankle
+
+            if abs(cmd_yaw) > 0.05:
+                q_target[0] += cmd_yaw * 0.12
+                q_target[5] -= cmd_yaw * 0.12
+
+            q_target[11] += -sgn * amp * sl * 0.15
+            q_target[15] += -sgn * amp * sr * 0.15
+
+        # ── 2. PD joint torques ──────────────────────────────────
+        q = data.qpos[7:]
+        dq = data.qvel[6:]
+        torques = KP * (q_target - q) - KD * dq
+
+        for i in range(self.nu):
+            lo, hi = self.model.actuator_ctrlrange[i]
+            torques[i] = np.clip(torques[i], lo, hi)
+        data.ctrl[:] = torques
+
+        # ── 3. Balance: virtual force on pelvis ──────────────────
+        self._apply_balance_force(data)
+
+    def _apply_balance_force(self, data):
+        """Apply virtual stabilizing force at pelvis to keep CoM over feet."""
+        # Compute CoM
+        com = np.zeros(3)
+        com_vel = np.zeros(3)
+        tm = 0.0
+        for i in range(1, self.model.nbody):
+            m = self.model.body_mass[i]
+            com += data.xipos[i] * m
+            v6 = np.zeros(6)
+            mujoco.mj_objectVelocity(
+                self.model, data, mujoco.mjtObj.mjOBJ_BODY, i, v6, 0)
+            com_vel += v6[3:6] * m
+            tm += m
+        com /= tm
+        com_vel /= tm
+
+        # Support center
+        sup = (data.xpos[self.lankle_id] + data.xpos[self.rankle_id]) / 2.0
+
+        # CoM error (horizontal only)
+        dx = com[0] - sup[0]
+        dy = com[1] - sup[1]
+        dvx, dvy = com_vel[0], com_vel[1]
+
+        # Root orientation errors
+        qw, qx, qy, qz = data.qpos[3:7]
+        roll  = np.arctan2(2*(qw*qx + qy*qz), 1 - 2*(qx**2 + qy**2))
+        pitch = np.arctan2(2*(qw*qy - qz*qx), 1 - 2*(qx**2 + qy**2))
+        roll_rate  = data.qvel[3]
+        pitch_rate = data.qvel[4]
+
+        # Horizontal stabilizing forces (PD on CoM position)
+        kp_h, kd_h = 800.0, 200.0
+        fx = np.clip(-(kp_h * dx + kd_h * dvx), -200, 200)
+        fy = np.clip(-(kp_h * dy + kd_h * dvy), -200, 200)
+
+        # Angular stabilizing torques (PD on orientation)
+        kp_a, kd_a = 200.0, 50.0
+        tx = np.clip(-(kp_a * roll  + kd_a * roll_rate),  -100, 100)
+        ty = np.clip(-(kp_a * pitch + kd_a * pitch_rate), -100, 100)
+
+        # Apply to pelvis: [torque_x, torque_y, torque_z, force_x, force_y, force_z]
+        data.xfrc_applied[self.pelvis_id, :] = [tx, ty, 0, fx, fy, 0]
+
+
+# ─── Model Loading ───────────────────────────────────────────────────────────
+
+def load_h1():
+    xml_path = h1_mj_description.MJCF_PATH
+    xml_dir = str(Path(xml_path).parent)
+
+    with open(xml_path) as f:
+        xml = f.read()
+
+    xml = xml.replace('meshdir="assets"', f'meshdir="{xml_dir}/assets"')
+    xml = xml.replace('texturedir="assets"', f'texturedir="{xml_dir}/assets"')
+
+    import re
+    fb = '  <visual>\n    <global offwidth="1280" offheight="720"/>\n  </visual>'
+    if not re.search(r'^\s*<visual\s*>', xml, re.MULTILINE):
+        xml = re.sub(r'(<mujoco[^>]*>)', r'\1\n' + fb, xml, count=1)
+
+    xml = inject_terrain(xml, "flat")
+    model = mujoco.MjModel.from_xml_string(xml)
+    data = mujoco.MjData(model)
+    return model, data
+
+
+def reset(model, data, ctrl):
+    mujoco.mj_resetData(model, data)
+    data.qpos[2] = ROOT_Z
+    data.qpos[3:7] = [1, 0, 0, 0]
+    data.qpos[7:] = Q_DEFAULT
+    data.qvel[:] = 0
+    data.xfrc_applied[:] = 0
+    ctrl.phase = 0.0
+    mujoco.mj_forward(model, data)
+
+
+# ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Interactive real-time MuJoCo controller for Unitree H1",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Controls (interactive mode):
-  W/↑      Forward         S/↓      Backward
-  A/←      Turn Left       D/→      Turn Right
-  SPACE    Reset Robot     Q/ESC    Quit
-  R        Toggle Record
-
-Examples:
-  # Manual control (interactive viewer):
-  PYTHONPATH=. python scripts/play_h1.py --mode manual
-
-  # Policy inference:
-  PYTHONPATH=. python scripts/play_h1.py --mode policy --checkpoint <path.pt>
-
-  # Record offscreen video (no display):
-  PYTHONPATH=. MUJOCO_GL=egl python scripts/play_h1.py \\
-      --mode manual --offscreen --output h1_walk.mp4
-""")
-    parser.add_argument("--mode", default="manual", choices=["manual", "policy"],
-                        help="Control mode (default: manual)")
-    parser.add_argument("--checkpoint", default=None,
-                        help="Path to trained .pt checkpoint (required for policy mode)")
-    parser.add_argument("--offscreen", action="store_true",
-                        help="Record offscreen video instead of interactive viewer")
-    parser.add_argument("--record", action="store_true",
-                        help="Enable recording in interactive mode (press R to toggle)")
-    parser.add_argument("--output", default="h1_play.mp4",
-                        help="Output video path (default: h1_play.mp4)")
-    parser.add_argument("--steps", type=int, default=10000,
-                        help="Max steps (interactive) or total steps (offscreen)")
-    parser.add_argument("--fps", type=int, default=50,
-                        help="Video FPS (default: 50)")
-    parser.add_argument("--width", type=int, default=960)
-    parser.add_argument("--height", type=int, default=540)
+    parser = argparse.ArgumentParser(description="H1 Interactive Controller")
+    parser.add_argument("--offscreen", action="store_true")
+    parser.add_argument("--output", default="videos/h1_demo.mp4")
+    parser.add_argument("--steps", type=int, default=500)
     args = parser.parse_args()
 
+    model, data = load_h1()
+    ctrl = H1Controller(model)
+    frame_skip = 10
+    ctrl_dt = model.opt.timestep * frame_skip
+
     if args.offscreen:
-        run_offscreen(
-            mode            = args.mode,
-            checkpoint_path = args.checkpoint,
-            output          = args.output,
-            n_steps         = args.steps,
-            fps             = args.fps,
-            width           = args.width,
-            height          = args.height,
-        )
-    else:
-        run_interactive(
-            mode            = args.mode,
-            checkpoint_path = args.checkpoint,
-            record          = args.record,
-            output          = args.output,
-            max_steps       = args.steps,
-            fps             = args.fps,
-        )
+        # ── Offscreen recording ──────────────────────────────
+        import imageio
+        renderer = mujoco.Renderer(model, 540, 960)
+        cam = mujoco.MjvCamera()
+        cam.type = mujoco.mjtCamera.mjCAMERA_FREE
+        cam.azimuth, cam.elevation, cam.distance = 135, -20, 4.5
+        cam.lookat[:] = [0, 0, 0.9]
+        opt = mujoco.MjvOption()
+        opt.flags[mujoco.mjtVisFlag.mjVIS_CONTACTFORCE] = True
+
+        reset(model, data, ctrl)
+        frames = []
+        n = args.steps
+
+        # Phase 1: Stand (2s)
+        n1 = min(100, n)
+        print(f"[1/3] Standing {n1} steps...")
+        for step in range(n1):
+            ctrl.step(data, 0.0, 0.0, ctrl_dt)
+            for _ in range(frame_skip): mujoco.mj_step(model, data)
+            cam.lookat[0] = float(data.qpos[0])
+            renderer.update_scene(data, camera=cam, scene_option=opt)
+            frames.append(renderer.render().copy())
+        tz = data.xpos[ctrl.torso_id, 2]
+        print(f"  torso_z={tz:.3f}")
+
+        # Phase 2: Walk (6s)
+        n2 = min(300, n - n1)
+        if n2 > 0:
+            print(f"[2/3] Walking {n2} steps...")
+            for step in range(n2):
+                ctrl.step(data, 0.8, 0.0, ctrl_dt)
+                for _ in range(frame_skip): mujoco.mj_step(model, data)
+                cam.lookat[0] = float(data.qpos[0])
+                renderer.update_scene(data, camera=cam, scene_option=opt)
+                frames.append(renderer.render().copy())
+            tz = data.xpos[ctrl.torso_id, 2]
+            vx = data.qvel[0]
+            print(f"  torso_z={tz:.3f} vx={vx:+.3f}")
+
+        # Phase 3: Stand again
+        n3 = n - n1 - max(n2, 0)
+        if n3 > 0:
+            print(f"[3/3] Standing {n3} steps...")
+            for step in range(n3):
+                ctrl.step(data, 0.0, 0.0, ctrl_dt)
+                for _ in range(frame_skip): mujoco.mj_step(model, data)
+                cam.lookat[0] = float(data.qpos[0])
+                renderer.update_scene(data, camera=cam, scene_option=opt)
+                frames.append(renderer.render().copy())
+            tz = data.xpos[ctrl.torso_id, 2]
+            print(f"  torso_z={tz:.3f}")
+
+        out = Path(args.output)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        imageio.mimwrite(str(out), frames, fps=50, quality=8, macro_block_size=1)
+        mb = out.stat().st_size / 1024 / 1024
+        print(f"\n✅ Saved: {out} ({len(frames)} frames, {mb:.1f} MB)")
+        renderer.close()
+        return
+
+    # ── Interactive viewer ───────────────────────────────────
+    reset(model, data, ctrl)
+    ks = KeyState()
+
+    print("=" * 50)
+    print("  Unitree H1 — Interactive Controller")
+    print("=" * 50)
+    print("  W = Forward    S = Backward")
+    print("  A = Turn Left  D = Turn Right")
+    print("  SPACE = Reset  Q = Quit")
+    print("=" * 50)
+
+    with mujoco.viewer.launch_passive(model, data, key_callback=make_key_cb(ks)) as viewer:
+        viewer.cam.azimuth = 135
+        viewer.cam.elevation = -20
+        viewer.cam.distance = 4.5
+        viewer.cam.lookat[:] = [0, 0, 0.9]
+
+        step = 0
+        t_prev = time.time()
+
+        while viewer.is_running() and not ks.quit:
+            if ks.reset:
+                reset(model, data, ctrl)
+                ks.reset = False
+                step = 0
+                print("[Reset]")
+
+            ctrl.step(data, ks.vx, ks.yaw, ctrl_dt)
+            for _ in range(frame_skip):
+                mujoco.mj_step(model, data)
+            step += 1
+
+            viewer.cam.lookat[0] = float(data.qpos[0])
+            viewer.cam.lookat[1] = float(data.qpos[1])
+
+            if step % 200 == 0:
+                tz = data.xpos[ctrl.torso_id, 2]
+                vx = data.qvel[0]
+                print(f"  step={step:5d} torso_z={tz:.3f} vx={vx:+.3f} cmd=[{ks.vx:.1f},{ks.yaw:.1f}]")
+
+            # Auto-reset if fallen
+            tz = data.xpos[ctrl.torso_id, 2]
+            if tz < 0.4:
+                print(f"  [Fell at step {step}] Auto-reset")
+                reset(model, data, ctrl)
+                step = 0
+
+            viewer.sync()
+
+            t_now = time.time()
+            if t_now - t_prev < ctrl_dt:
+                time.sleep(ctrl_dt - (t_now - t_prev))
+            t_prev = time.time()
+
+    print("\nDone.")
 
 
 if __name__ == "__main__":
