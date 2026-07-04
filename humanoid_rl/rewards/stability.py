@@ -88,4 +88,5 @@ class StabilityRewards:
         return reward
 
     def reset(self):
+        """Reset internal state (called on env reset)."""
         pass

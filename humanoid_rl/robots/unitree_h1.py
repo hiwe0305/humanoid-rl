@@ -9,15 +9,24 @@ from pathlib import Path
 
 def _get_h1_xml_path() -> str:
     """
-    Try robot_descriptions package first (downloads + caches MuJoCo Menagerie),
-    fallback to local assets/ copy if available.
-    """
-    # Try robot_descriptions (recommended)
+    Try robot_descriptions package first, then pip cache, then local copy.
+    "/"""
+    # Try robot_descriptions (recommended, requires internet)
     try:
         from robot_descriptions import h1_mj_description
         return h1_mj_description.MJCF_PATH
     except ImportError:
         pass
+
+    # Try pip cache
+    cache_roots = [
+        Path.home() / ".cache" / "robot_descriptions" / "mujoco_menagerie" / "unitree_h1",
+        Path("/home/ubuntu/.cache/robot_descriptions/mujoco_menagerie/unitree_h1"),
+    ]
+    for d in cache_roots:
+        xml = d / "h1.xml"
+        if xml.exists():
+            return str(xml.resolve())
 
     # Fallback: local assets
     local = Path(__file__).parent / "assets" / "unitree_h1.xml"
@@ -25,7 +34,8 @@ def _get_h1_xml_path() -> str:
         return str(local)
 
     raise FileNotFoundError(
-        "Unitree H1 MJCF not found. Install: pip install robot_descriptions"
+        f"Unitree H1 MJCF not found. "
+        f"Tried: robot_descriptions, {cache_roots}, {local}"
     )
 
 

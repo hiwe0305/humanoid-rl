@@ -24,6 +24,7 @@ from torch.optim.lr_scheduler import LinearLR
 from humanoid_rl.algorithms.ppo.actor_critic import ActorCritic
 from humanoid_rl.algorithms.ppo.rollout_buffer import PPORolloutBuffer
 from humanoid_rl.utils.logger import Logger
+from humanoid_rl.utils.video_recorder import VideoRecorder
 from humanoid_rl.utils.checkpoint import Checkpoint
 
 
@@ -59,6 +60,10 @@ class PPOTrainer:
         "lr_anneal":     True,
         # Total training
         "total_steps":   10_000_000,
+        # Video recording
+        "record_video":  False,   # enable periodic video recording
+        "record_every":  50,      # record video every N updates
+        "robot_name":    "h1",    # robot name for video recorder
         # Checkpointing
         "save_every":    100,    # save every N updates
         "eval_every":    50,
@@ -127,6 +132,18 @@ class PPOTrainer:
         self._ret_rms_count = 0
         self._ret_running   = np.zeros(self.cfg["n_envs"], dtype=np.float32)  # discounted return tracker
 
+        # Video recording (optional)
+        self.video_recorder = None
+        if self.cfg.get("record_video", False):
+            self.video_recorder = VideoRecorder(
+                env_fn=env_fn,
+                log_dir=str(self.log_dir),
+                record_every=self.cfg.get("record_every", 50),
+                fps=50,
+                robot_name=self.cfg.get("robot_name", "h1"),
+            )
+            print(f"[PPO] Video recording enabled: every {self.cfg.get('record_every', 50)} updates")
+
         # State
         self.global_step    = 0
         self.update_count   = 0
@@ -186,6 +203,13 @@ class PPOTrainer:
                 "update_time":  update_time,
             })
             self.logger.log(metrics, step=self.global_step)
+            
+            # Record training video
+            if self.video_recorder is not None:
+                self.video_recorder.step(
+                    update_count=self.update_count,
+                    metrics=metrics,
+                )
 
             if self.update_count % 10 == 0:
                 elapsed = time.time() - t_start
@@ -208,6 +232,8 @@ class PPOTrainer:
         self.save("final")
         self.envs.close()
         self.logger.close()
+        if self.video_recorder:
+            self.video_recorder.close()
         print("[PPO] Training complete.")
 
     # ─── Rollout collection ────────────────────────────────────────────────

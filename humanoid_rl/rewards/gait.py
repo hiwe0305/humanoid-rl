@@ -19,8 +19,10 @@ L_KNEE      = 3;  R_KNEE      = 8
 L_ANKLE     = 4;  R_ANKLE     = 9
 L_HIP_ROLL  = 1;  R_HIP_ROLL  = 6
 
-# CPG gait params (H1 @ 1.0 m/s)
-GAIT_PERIOD_STEPS = 40    # slightly faster: 0.8s period → more steps per episode
+# Default gait period (seconds). If control_dt is known, GaitRewards
+# converts this to steps internally. The period is set via config or
+# defaults to 0.8s (matching H1 walking gait at ~1.0 m/s).
+DEFAULT_GAIT_PERIOD_S = 0.8
 HIP_AMP    = 0.30
 KNEE_AMP   = 0.25
 ANKLE_AMP  = 0.12
@@ -34,7 +36,7 @@ class GaitRewards:
     Key insight: phải phạt nặng khi CẢ 2 chân tiếp đất (double stance > 50% thời gian).
     """
 
-    def __init__(self, cfg: dict):
+    def __init__(self, cfg: dict, control_dt: float = 0.025):
         self.cpg_weight         = cfg.get("cpg_weight",         2.0)   # tăng
         self.contact_weight     = cfg.get("contact_weight",     3.0)   # tăng
         self.clearance_weight   = cfg.get("clearance_weight",   2.0)   # tăng
@@ -42,6 +44,9 @@ class GaitRewards:
         self.foot_slip_weight   = cfg.get("foot_slip_weight",   1.0)   # tăng
         self.double_stance_pen  = cfg.get("double_stance_pen",  4.0)   # NEW: phạt cả 2 chân xuống
         self.clearance_height   = cfg.get("clearance_height",   FOOT_TARGET_HEIGHT)
+        # Gait period in steps = period_seconds / control_dt
+        gait_period_s = cfg.get("gait_period_s", DEFAULT_GAIT_PERIOD_S)
+        self._gait_period_steps = max(2, int(round(gait_period_s / control_dt)))
 
         self._phase: float = 0.0
 
@@ -81,7 +86,7 @@ class GaitRewards:
         vx         = state.get("vx", 0.0)
 
         # Advance phase
-        self._phase = (step_count / GAIT_PERIOD_STEPS) % 1.0
+        self._phase = (step_count / self._gait_period_steps) % 1.0
 
         q_joints = state["q_joints"]
         q_ref    = self._cpg_reference()

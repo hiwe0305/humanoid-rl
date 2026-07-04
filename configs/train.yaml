@@ -1,7 +1,7 @@
 # configs/train.yaml — Master Hydra config
 
 defaults:
-  - robot: humanoid     # "humanoid" | "h1"
+  - robot: h1           # Mặc định dùng H1 (PD control) — generic humanoid cần override
   - task: walk          # "walk" | "run" | "stair" | "jump"
   - algo: ppo
   - _self_
@@ -10,17 +10,17 @@ defaults:
 train:
   total_steps: 10_000_000
   use_gpu: true
-  save_every: 100       # save checkpoint every N updates
-  eval_every: 50        # evaluate every N updates
+  save_every: 100
+  eval_every: 50
 
 # Environment settings
 env:
-  frame_skip: 5         # physics steps per control step (5 × 0.002s = 0.01s = 100Hz control)
+  frame_skip: 5
 
-# Data collection settings (used by collect_data.py)
+# Data collection settings
 collector:
   n_episodes: 200
   n_envs: 8
   output_dir: data/raw
   save_every: 50
-  policy_checkpoint: null   # set to use trained policy
+  policy_checkpoint: null

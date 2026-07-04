@@ -55,6 +55,14 @@ class PDController:
         # Default joint positions (from model initial state)
         self._q_default = np.zeros(nu, dtype=np.float32)
 
+        # Gear ratio: motor actuator force = ctrl * gear
+        # We compute torques in joint space, then divide by gear for ctrl
+        self._gear = np.ones(nu, dtype=np.float32)
+        if hasattr(model, 'actuator_gear') and model.actuator_gear is not None:
+            gear = model.actuator_gear[:, 0].copy()
+            if not np.all(gear == 0):
+                self._gear = np.abs(gear).astype(np.float32)
+
         # Torque limits
         if torque_limit is not None:
             self.torque_limit = np.asarray(torque_limit, dtype=np.float32)
@@ -91,9 +99,12 @@ class PDController:
         q_curr  = q[qpos_offset: qpos_offset + self.nu]
         dq_curr = dq[qvel_offset: qvel_offset + self.nu]
 
-        # PD law
+        # PD law (joint-space torques)
         torques = self.kp * (q_target - q_curr) - self.kd * dq_curr
 
-        # Clip to torque limits
+        # Clip to torque limits (joint space)
         torques = np.clip(torques, -self.torque_limit, self.torque_limit)
+        # Convert to motor ctrl space: ctrl = torque / gear
+        # MuJoCo motor actuator: force_applied = ctrl * gear
+        torques = torques / self._gear
         return torques.astype(np.float32)

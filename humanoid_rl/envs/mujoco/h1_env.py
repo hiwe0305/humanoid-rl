@@ -221,7 +221,7 @@ class H1Env(BaseHumanoidEnv):
         self._energy_rewards = EnergyRewards(reward_cfg.get("energy", {}))
         # Gait rewards: only active if "gait" key present in task config
         gait_cfg = reward_cfg.get("gait", None)
-        self._gait_rewards = GaitRewards(gait_cfg) if gait_cfg else None
+        self._gait_rewards = GaitRewards(gait_cfg, control_dt=self._ctrl_dt) if gait_cfg else None
 
         # ── Task params ──────────────────────────────────────────────────────
         self._max_steps    = task_cfg.get("max_steps", 1000)
@@ -325,10 +325,15 @@ class H1Env(BaseHumanoidEnv):
         total_m = 0.0
         for i in range(1, m.nbody):
             mi = m.body_mass[i]
+            # CoM position — xipos is body CoM in world frame (CORRECT)
             com += d.xipos[i] * mi
+            # CoM velocity — mj_objectVelocity returns body frame origin,
+            # but CoM can be offset. Fix: v_com = v_frame + omega * r_offset
             v6 = np.zeros(6)
             mujoco.mj_objectVelocity(m, d, mujoco.mjtObj.mjOBJ_BODY, i, v6, 0)
-            com_vel += v6[3:6] * mi
+            r_offset = d.xipos[i] - d.xpos[i]
+            body_com_vel = v6[3:6] + np.cross(v6[0:3], r_offset)
+            com_vel += body_com_vel * mi
             total_m += mi
         com /= total_m
         com_vel /= total_m
@@ -380,14 +385,16 @@ class H1Env(BaseHumanoidEnv):
         """
         Return binary foot contact indicators using body-based approach.
 
-        H1 uses capsule geoms on ankle links (named e.g. 'id=42').
-        Contact geom IDs are resolved to their parent body, then matched
-        against left_ankle_link / right_ankle_link bodies.
+        Uses rootid comparison to detect floor contacts: any body whose
+        root body is NOT the robot root is considered "ground". This is
+        more robust than checking body==0 (world body) because some models
+        may have additional kinematic chains attached to world.
         """
         contacts = np.zeros(2, dtype=np.float32)
 
-        # Pre-resolve foot body IDs
+        # Pre-resolve body IDs (cached)
         if not hasattr(self, '_lfoot_bid'):
+            self._robot_root_bid = 1  # body 1 = robot root (pelvis)
             try:
                 self._lfoot_bid = mujoco.mj_name2id(
                     self._model, mujoco.mjtObj.mjOBJ_BODY, self._lfoot_body)
@@ -404,15 +411,19 @@ class H1Env(BaseHumanoidEnv):
             # Resolve geom → body
             b1 = self._model.geom_bodyid[c.geom1]
             b2 = self._model.geom_bodyid[c.geom2]
-            # One of the bodies must be floor (body 0 = world)
-            touching_ground = (b1 == 0 or b2 == 0)
-            other_body = b2 if b1 == 0 else b1
+            # Ground contact: the geom that is NOT part of the robot subtree
+            b1_is_robot = self._model.body_rootid[b1] == self._robot_root_bid
+            b2_is_robot = self._model.body_rootid[b2] == self._robot_root_bid
+            touching_ground = b1_is_robot != b2_is_robot  # one robot, one ground
+            if not touching_ground:
+                continue
 
-            if touching_ground:
-                if other_body == self._lfoot_bid:
-                    contacts[0] = 1.0
-                elif other_body == self._rfoot_bid:
-                    contacts[1] = 1.0
+            other_body = b2 if b1_is_robot else b1
+
+            if other_body == self._lfoot_bid:
+                contacts[0] = 1.0
+            elif other_body == self._rfoot_bid:
+                contacts[1] = 1.0
 
         return contacts
 
@@ -437,15 +448,17 @@ class H1Env(BaseHumanoidEnv):
 
     def _step_simulation(self, action: np.ndarray) -> None:
         """PD control: action = normalized joint offsets [-1,1] → torques."""
-        torques = self._pd.compute_torques(
-            action     = action,
-            q          = self._data.qpos,
-            dq         = self._data.qvel,
-            qpos_offset = 7,
-            qvel_offset = 6,
-        )
-        self._data.ctrl[:] = torques
         for _ in range(self.frame_skip):
+            # Recompute PD torques at each sub-step so restoring force
+            # tracks changing joint position.
+            torques = self._pd.compute_torques(
+                action     = action,
+                q          = self._data.qpos,
+                dq         = self._data.qvel,
+                qpos_offset = 7,
+                qvel_offset = 6,
+            )
+            self._data.ctrl[:] = torques
             if self._push_rand is not None:
                 self._push_rand.step(self._model, self._data, self._rng)
             mujoco.mj_step(self._model, self._data)
@@ -532,6 +545,22 @@ class H1Env(BaseHumanoidEnv):
             return True
         if np.any(np.isnan(self._data.qpos)):
             return True
+        # Joint limit violation: terminate if any joint exceeds its range
+        # by more than 10% (safety margin). Prevents hyperextension and
+        # eliminates degenerate poses from the replay buffer.
+        for jid in range(self._model.njnt):
+            if not self._model.jnt_limited[jid]:
+                continue
+            qpos_adr = self._model.jnt_qposadr[jid]
+            if qpos_adr < 7:  # skip root free joint (x,y,z,quat)
+                continue
+            lo, hi = self._model.jnt_range[jid]
+            if lo >= hi:
+                continue
+            pos = self._data.qpos[qpos_adr]
+            margin = 0.1 * (hi - lo)
+            if pos < lo - margin or pos > hi + margin:
+                return True
         return False
 
     def _is_truncated(self) -> bool:
@@ -578,11 +607,9 @@ class H1Env(BaseHumanoidEnv):
         self._obs_history = None
         self._prev_action[:] = 0.0
 
-        # Reset reward state
+        # Reset reward state (all use .reset(), no replacement)
         self._loco_rewards.reset()
-        self._stab_rewards = StabilityRewards(
-            self.task_cfg.get("rewards", {}).get("stability", {})
-        )
+        self._stab_rewards.reset()
         self._energy_rewards.reset()
         if self._gait_rewards is not None:
             self._gait_rewards.reset()

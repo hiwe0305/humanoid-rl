@@ -191,11 +191,14 @@ def inject_terrain(base_xml: str, terrain_type: str, **kwargs) -> str:
     """
     terrain_xml = get_terrain_xml(terrain_type, **kwargs)
 
-    # Always add floor plane (H1 Menagerie XML has no floor)
-    floor_geom = (
-        '    <geom name="floor" type="plane" size="50 50 0.1" '
-        'rgba="0.75 0.75 0.75 1" contype="1" conaffinity="1" friction="0.8 0.1 0.1"/>'
-    )
+    # Add floor plane (skip if one already exists in the XML)
+    if 'name="floor"' in base_xml:
+        floor_geom = ''
+    else:
+        floor_geom = (
+            '    <geom name="floor" type="plane" size="50 50 0.1" '
+            'rgba="0.75 0.75 0.75 1" contype="1" conaffinity="1" friction="0.8 0.1 0.1"/>'
+        )
 
     inject = floor_geom
     if terrain_xml:
