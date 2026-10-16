@@ -23,7 +23,7 @@ L_HIP_ROLL  = 1;  R_HIP_ROLL  = 6
 # converts this to steps internally. The period is set via config or
 # defaults to 0.8s (matching H1 walking gait at ~1.0 m/s).
 DEFAULT_GAIT_PERIOD_S = 0.8
-HIP_AMP    = 0.30
+HIP_AMP    = 0.20   # < H1_ACTION_SCALE (0.3) so the reference stays reachable
 KNEE_AMP   = 0.25
 ANKLE_AMP  = 0.12
 HIP_ROLL_AMP = 0.08
@@ -36,7 +36,7 @@ class GaitRewards:
     Key insight: phải phạt nặng khi CẢ 2 chân tiếp đất (double stance > 50% thời gian).
     """
 
-    def __init__(self, cfg: dict, control_dt: float = 0.025):
+    def __init__(self, cfg: dict, control_dt: float = 0.025, default_q: np.ndarray | None = None):
         self.cpg_weight         = cfg.get("cpg_weight",         2.0)   # tăng
         self.contact_weight     = cfg.get("contact_weight",     3.0)   # tăng
         self.clearance_weight   = cfg.get("clearance_weight",   2.0)   # tăng
@@ -48,30 +48,45 @@ class GaitRewards:
         gait_period_s = cfg.get("gait_period_s", DEFAULT_GAIT_PERIOD_S)
         self._gait_period_steps = max(2, int(round(gait_period_s / control_dt)))
 
+        # Robot default (standing) joint pose. The CPG reference is defined as
+        # offsets around it so it is always reachable by the PD target
+        # (default +- action_scale). If None, fall back to legacy absolute pose.
+        self._default_q = None if default_q is None else np.asarray(default_q, dtype=np.float32)
+
         self._phase: float = 0.0
 
     def reset(self) -> None:
         self._phase = 0.0
 
+    def phase_features(self, step_count: int) -> np.ndarray:
+        """[sin, cos] of the gait phase for control step `step_count`."""
+        phi = 2 * np.pi * ((step_count / self._gait_period_steps) % 1.0)
+        return np.array([np.sin(phi), np.cos(phi)], dtype=np.float32)
+
     def _cpg_reference(self) -> np.ndarray:
         phi = self._phase * 2 * np.pi
-        q_ref = np.zeros(19, dtype=np.float32)
+        if self._default_q is not None:
+            q_ref = self._default_q.copy()
+            hip_base = knee_base = ankle_base = 0.0   # offsets added to default below
+        else:
+            q_ref = np.zeros(19, dtype=np.float32)
+            hip_base, knee_base, ankle_base = -0.35, 0.70, -0.35
 
         # Hip pitch: alternating ±HIP_AMP around default
-        q_ref[L_HIP_PITCH] = -0.35 + HIP_AMP * np.sin(phi)
-        q_ref[R_HIP_PITCH] = -0.35 - HIP_AMP * np.sin(phi)
+        q_ref[L_HIP_PITCH] += hip_base + HIP_AMP * np.sin(phi)
+        q_ref[R_HIP_PITCH] += hip_base - HIP_AMP * np.sin(phi)
 
         # Knee: bend only during swing phase
-        q_ref[L_KNEE] = 0.70 + KNEE_AMP * max(0.0, -np.sin(phi))
-        q_ref[R_KNEE] = 0.70 + KNEE_AMP * max(0.0,  np.sin(phi))
+        q_ref[L_KNEE] += knee_base + KNEE_AMP * max(0.0, -np.sin(phi))
+        q_ref[R_KNEE] += knee_base + KNEE_AMP * max(0.0,  np.sin(phi))
 
         # Ankle
-        q_ref[L_ANKLE] = -0.35 - ANKLE_AMP * np.sin(phi)
-        q_ref[R_ANKLE] = -0.35 + ANKLE_AMP * np.sin(phi)
+        q_ref[L_ANKLE] += ankle_base - ANKLE_AMP * np.sin(phi)
+        q_ref[R_ANKLE] += ankle_base + ANKLE_AMP * np.sin(phi)
 
         # Hip roll: weight shift
-        q_ref[L_HIP_ROLL] = HIP_ROLL_AMP * np.sin(phi)
-        q_ref[R_HIP_ROLL] = HIP_ROLL_AMP * np.sin(phi + np.pi)
+        q_ref[L_HIP_ROLL] += HIP_ROLL_AMP * np.sin(phi)
+        q_ref[R_HIP_ROLL] += HIP_ROLL_AMP * np.sin(phi + np.pi)
 
         return q_ref
 

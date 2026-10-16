@@ -97,6 +97,7 @@ def make_env_fn(task_cfg: dict, domain_rand: bool = False, push_rand: bool = Fal
             domain_rand_cfg = DOMAIN_RAND_CFG if domain_rand else None,
             push_rand_cfg   = PUSH_RAND_CFG   if push_rand  else None,
             frame_skip      = 10,
+            history_len     = 3,
         )
     return env_fn
 
@@ -122,14 +123,14 @@ def train_phase(phase_id: int, n_envs: int, resume_from: str | None = None) -> s
         "gamma":            0.99,
         "gae_lambda":       0.95,
         "clip_coef":        0.2,
-        "clip_value":       True,
+        "clip_value":       False,
         "value_coef":       0.5,
         "entropy_coef":     0.01,
         "lr":               cfg["lr"],
         "max_grad_norm":    0.5,
         "lr_anneal":        True,
         "normalize_obs":    True,
-        "normalize_reward": False,   # raw rewards — trustworthy metrics
+        "normalize_reward": True,    # return-std scaling; episode returns are still logged raw
         "total_steps":      cfg["total_steps"],
         "save_every":       10,      # checkpoint mỗi 10 updates
         "actor_hidden":     [512, 256, 128],

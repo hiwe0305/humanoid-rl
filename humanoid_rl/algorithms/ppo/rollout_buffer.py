@@ -102,13 +102,17 @@ class PPORolloutBuffer:
         """
         gae = np.zeros(self.n_envs, dtype=np.float32)
 
+        # NOTE: self.dones[t] is the done flag RETURNED BY step t (i.e. episode
+        # ended right after action t), so the bootstrap mask of step t is
+        # 1 - dones[t]. (CleanRL stores the *previous* step's done instead,
+        # which is why its mask uses dones[t+1]; using that here leaks GAE
+        # across episode boundaries.)
         for step in reversed(range(self.n_steps)):
+            next_non_terminal = 1.0 - self.dones[step]
             if step == self.n_steps - 1:
-                next_non_terminal = 1.0 - last_dones.astype(np.float32)
-                next_values       = last_values
+                next_values = last_values
             else:
-                next_non_terminal = 1.0 - self.dones[step + 1]
-                next_values       = self.values[step + 1]
+                next_values = self.values[step + 1]
 
             delta = (
                 self.rewards[step]

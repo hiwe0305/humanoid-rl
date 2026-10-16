@@ -241,7 +241,7 @@ class MuJoCoHumanoidEnv(BaseHumanoidEnv):
             b2_is_robot = self._model.body_rootid[b2] == self._loco_robot_root
             if b1_is_robot == b2_is_robot:
                 continue
-            other = b2 if b1_is_robot else b1
+            other = b1 if b1_is_robot else b2
             if other == self._loco_lfoot_bid:
                 contacts[0] = 1.0
             elif other == self._loco_rfoot_bid:
@@ -336,6 +336,12 @@ class MuJoCoHumanoidEnv(BaseHumanoidEnv):
             return True
         if np.any(np.isnan(self._data.qpos)):
             return True
+        # Orientation termination: use root quaternion to detect fall
+        qw, qx, qy, qz = self._data.qpos[3:7]
+        pitch = np.arctan2(2*(qw*qy - qz*qx), 1 - 2*(qx**2 + qy**2))
+        roll  = np.arctan2(2*(qw*qx + qy*qz), 1 - 2*(qx**2 + qy**2))
+        if abs(pitch) > 0.8 or abs(roll) > 0.8:
+            return True
         return False
 
     def _is_truncated(self) -> bool:
@@ -393,7 +399,7 @@ class MuJoCoHumanoidEnv(BaseHumanoidEnv):
     def render(self):
         if self.render_mode == "human":
             if self._viewer is None:
-                self._viewer = mujoco.viewer.launch_passive(self._model, self._data)
+                from mujoco import viewer; self._viewer = viewer.launch_passive(self._model, self._data)
             self._viewer.sync()
         elif self.render_mode == "rgb_array":
             if self._renderer is None:

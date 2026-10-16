@@ -33,10 +33,13 @@ class LocomotionRewards:
         root_vel    = state["root_vel"]      # [vx, vy, vz]
         target_spd  = state["target_speed"]
 
-        # Forward velocity reward: exponential kernel (smooth, bounded)
+        # Forward velocity reward: exponential kernel (smooth, bounded).
+        # Kernel width grows with target speed so there is still a learning
+        # signal when starting from standing still (exp(-(0-3)^2)=1e-4 otherwise).
         vx = root_vel[0]
         vel_error  = vx - target_spd
-        reward += self.forward_vel_weight * np.exp(-vel_error ** 2)
+        sigma      = max(1.0, target_spd / 1.5)
+        reward += self.forward_vel_weight * np.exp(-(vel_error / sigma) ** 2)
 
         # Backward motion penalty (CRITICAL for walk training)
         # If vx < 0: penalty = backward_penalty × vx²
@@ -48,13 +51,15 @@ class LocomotionRewards:
         vy = root_vel[1]
         reward -= self.lateral_vel_penalty * vy ** 2
 
-        # Height gain (stair/jump)
+        # Height gain (stair/jump): reward only NEW record heights within the
+        # episode. Per-step max(dh,0) can be farmed by bobbing up and down.
         if self.height_gain_weight > 0:
             curr_h = state["torso_height"]
-            if self._prev_torso_height is not None:
-                dh = curr_h - self._prev_torso_height
-                reward += self.height_gain_weight * max(dh, 0.0)
-            self._prev_torso_height = curr_h
+            if self._prev_torso_height is None:
+                self._prev_torso_height = curr_h   # running max height
+            elif curr_h > self._prev_torso_height:
+                reward += self.height_gain_weight * (curr_h - self._prev_torso_height)
+                self._prev_torso_height = curr_h
 
         # Vertical velocity (jump task)
         if self.vertical_vel_weight > 0:

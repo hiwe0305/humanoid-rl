@@ -26,25 +26,25 @@ class StandTask:
 
     rewards: dict = field(default_factory=lambda: {
         "locomotion": {
-            "forward_vel_weight":  0.5,    # nhỏ: chỉ nhẹ thưởng vx ≈ 0
-            "backward_penalty":    1.0,    # phạt đi lùi
+            "forward_vel_weight":  0.2,    # rất nhỏ: chỉ cần không đi lùi
+            "backward_penalty":    2.0,    # phạt mạnh đi lùi
             "lateral_vel_penalty": 1.0,    # phạt trượt ngang
             "height_gain_weight":  0.0,
             "vertical_vel_weight": 0.0,
         },
         "stability": {
-            "upright_weight":       3.0,   # đứng thẳng
-            "alive_bonus":          2.0,   # sống lâu → thưởng nhiều
+            "upright_weight":       5.0,   # đứng thẳng
+            "alive_bonus":          5.0,   # sống lâu → thưởng nhiều hơn
             "min_torso_height":     0.5,   # cho robot cơ hội phục hồi
-            # Balance-specific rewards
-            "com_over_feet_weight": 5.0,   # MẠNH NHẤT: CoM nằm trên chân
-            "com_vel_penalty":      2.0,   # phạt CoM di chuyển nhanh
-            "orientation_weight":   3.0,   # thưởng body thẳng (roll/pitch nhỏ)
-            "angular_vel_penalty":  1.0,   # phạt lắc lư
-            "foot_contact_weight":  1.0,   # thưởng 2 chân chạm đất
+            # Balance-specific rewards - TĂNG ĐỂ LEARN NHANH HƠN
+            "com_over_feet_weight": 10.0,  # MẠNH NHẤT: CoM nằm trên chân
+            "com_vel_penalty":      5.0,    # phạt mạnh CoM di chuyển nhanh
+            "orientation_weight":   5.0,    # thưởng mạnh body thẳng
+            "angular_vel_penalty":  3.0,    # phạt mạnh lắc lư
+            "foot_contact_weight":  2.0,    # thưởng 2 chân chạm đất
         },
         "energy": {
-            "torque_penalty":      0.0005, # phạt mạnh hơn → tiết kiệm
+            "torque_penalty":      0.0001, # giảm penalty để tập trung balance
             "action_rate_penalty": 0.01,   # phạt thay đổi action nhanh
         },
     })

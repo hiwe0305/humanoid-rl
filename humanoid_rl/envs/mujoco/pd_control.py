@@ -35,13 +35,17 @@ class PDController:
         kp:           float | np.ndarray = 80.0,
         kd:           float | np.ndarray = 4.0,
         torque_limit: np.ndarray | None  = None,
-        action_scale: float              = 0.5,
+        action_scale: float | np.ndarray = 0.5,
     ):
         nu = model.nu
         self.nu           = nu
         self.kp           = np.broadcast_to(np.asarray(kp, dtype=np.float32), (nu,)).copy()
         self.kd           = np.broadcast_to(np.asarray(kd, dtype=np.float32), (nu,)).copy()
-        self.action_scale = float(action_scale)
+        # Per-joint action scale [nu]; scalar input is broadcast.
+        self.action_scale_vec = np.broadcast_to(
+            np.asarray(action_scale, dtype=np.float32), (nu,)).copy()
+        # Scalar summary (median) kept for backward compatibility.
+        self.action_scale = float(np.median(self.action_scale_vec))
 
         # Joint ranges from model
         self._jnt_range = np.zeros((nu, 2), dtype=np.float32)
@@ -90,7 +94,7 @@ class PDController:
             torques: shape [nu], clipped to torque_limit
         """
         # Target joint positions: q_default + action * action_scale
-        q_target = self._q_default + action * self.action_scale
+        q_target = self._q_default + action * self.action_scale_vec
 
         # Clip to joint range
         q_target = np.clip(q_target, self._jnt_range[:, 0], self._jnt_range[:, 1])

@@ -32,18 +32,19 @@ class Logger:
         except Exception as e:
             print(f"[Logger] TensorBoard unavailable: {e}")
 
-        # WandB (only if WANDB_API_KEY is set or user is logged in)
-        try:
-            import wandb
-            if os.environ.get("WANDB_API_KEY") or wandb.api.api_key:
-                self._wandb_run = wandb.init(
-                    project=project,
-                    name=run_name,
-                    dir=str(self.log_dir),
-                )
-                print(f"[Logger] WandB: {project}/{run_name}")
-        except Exception as e:
-            print(f"[Logger] WandB offline (set WANDB_API_KEY to enable): {e}")
+        # WandB (only if WANDB_API_KEY is set and not disabled)
+        if os.environ.get("WANDB_MODE") != "disabled":
+            try:
+                import wandb
+                if os.environ.get("WANDB_API_KEY") or wandb.api.api_key:
+                    self._wandb_run = wandb.init(
+                        project=project,
+                        name=run_name,
+                        dir=str(self.log_dir),
+                    )
+                    print(f"[Logger] WandB: {project}/{run_name}")
+            except Exception as e:
+                print(f"[Logger] WandB offline (set WANDB_API_KEY to enable): {e}")
 
     def log(self, metrics: dict[str, Any], step: int) -> None:
         if self._tb_writer is not None:

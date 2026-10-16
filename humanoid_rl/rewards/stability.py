@@ -50,9 +50,10 @@ class StabilityRewards:
         if torso_h > self.min_torso_height:
             reward += self.alive_bonus
 
-        # ── Upright reward ───────────────────────────────────────
-        upright_vec = state.get("upright_vec", np.array([0, 0, 1]))
-        upright_score = float(np.clip(upright_vec[2], -1.0, 1.0))
+        # ── Upright reward (quaternion pitch/roll — upright_vec is unreliable) ──
+        roll  = state.get("roll",  0.0)
+        pitch = state.get("pitch", 0.0)
+        upright_score = np.exp(-5.0 * (roll**2 + pitch**2))
         reward += self.upright_weight * upright_score
 
         # ── CoM over feet ────────────────────────────────────────

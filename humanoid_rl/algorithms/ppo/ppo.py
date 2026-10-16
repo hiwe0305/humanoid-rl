@@ -50,7 +50,7 @@ class PPOTrainer:
         "gae_lambda":    0.95,
         # PPO clip
         "clip_coef":     0.2,
-        "clip_value":    True,
+        "clip_value":    False,   # clip range is in return units; harmful with unnormalized returns
         # Losses
         "value_coef":    0.5,
         "entropy_coef":  0.005,
@@ -75,6 +75,7 @@ class PPOTrainer:
         cfg: dict | None = None,
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
         log_dir: str = "runs/ppo",
+        render_env_fn=None,
     ):
         self.cfg    = {**self.DEFAULT_CFG, **(cfg or {})}
         self.device = device
@@ -143,6 +144,13 @@ class PPOTrainer:
                 robot_name=self.cfg.get("robot_name", "h1"),
             )
             print(f"[PPO] Video recording enabled: every {self.cfg.get('record_every', 50)} updates")
+
+        # Interactive MuJoCo viewer (optional). Renders env 0 in real-time.
+        self._viewer_env = None
+        if render_env_fn is not None:
+            self._viewer_env = render_env_fn()
+            self._viewer_action = None
+            print(f"[PPO] Interactive viewer enabled")
 
         # State
         self.global_step    = 0
@@ -219,6 +227,7 @@ class PPOTrainer:
                     f"loss_pi={metrics.get('loss_pi', 0):.4f}  "
                     f"loss_v={metrics.get('loss_v', 0):.4f}  "
                     f"ep_ret={metrics.get('mean_ep_return', 0):.2f}  "
+                    f"ep_len={metrics.get('mean_ep_len', 0):.0f}  "
                     f"time={elapsed:.0f}s"
                 )
 
@@ -231,6 +240,8 @@ class PPOTrainer:
 
         self.save("final")
         self.envs.close()
+        if self._viewer_env is not None:
+            self._viewer_env.close()
         self.logger.close()
         if self.video_recorder:
             self.video_recorder.close()
@@ -243,6 +254,7 @@ class PPOTrainer:
         self.ac.eval()
 
         ep_returns: list[float] = []
+        ep_lengths: list[int] = []
 
         for _ in range(self.cfg["n_steps"]):
             with torch.no_grad():
@@ -257,29 +269,52 @@ class PPOTrainer:
             next_obs, rewards, terminated, truncated, infos = self.envs.step(actions_np)
             dones = (terminated | truncated).astype(np.float32)
 
+            # Step interactive viewer to match env 0 (if enabled)
+            if self._viewer_env is not None:
+                if self._viewer_action is not None:
+                    self._viewer_env.step(self._viewer_action)
+                    self._viewer_env.render()
+                self._viewer_action = actions_np[0].copy()
+
             # Reward normalization via running return std (Welford)
             if self._normalize_reward:
                 gamma = self.cfg["gamma"]
                 self._ret_running = self._ret_running * gamma + rewards
-                # Update running stats
+                # Update running stats (Chan et al. parallel variance)
                 batch = self._ret_running
                 n = len(batch)
-                self._ret_rms_count += n
-                delta = batch.mean() - self._ret_rms_mean
-                self._ret_rms_mean += delta * n / self._ret_rms_count
-                self._ret_rms_var  = (
-                    (self._ret_rms_var * (self._ret_rms_count - n) + np.var(batch) * n)
-                    / self._ret_rms_count
-                )
+                old_count = self._ret_rms_count
+                tot = old_count + n
+                delta = float(batch.mean()) - self._ret_rms_mean
+                m2 = (self._ret_rms_var * old_count + float(np.var(batch)) * n
+                      + delta ** 2 * old_count * n / max(tot, 1))
+                self._ret_rms_mean += delta * n / tot
+                self._ret_rms_var   = m2 / tot
+                self._ret_rms_count = tot
                 ret_std = float(np.sqrt(self._ret_rms_var + 1e-8))
                 rewards = rewards / ret_std
                 # Reset running return on episode end
                 self._ret_running[dones > 0] = 0.0
 
-            # Collect episode returns
+            # Collect episode returns / lengths
             for i, (done, info) in enumerate(zip(dones, infos)):
                 if done and "episode_return" in info:
                     ep_returns.append(info["episode_return"])
+                    ep_lengths.append(info.get("episode_length", 0))
+
+            # Time-limit truncation is NOT a failure: bootstrap with V(s_terminal)
+            # so the critic is not taught that the future is worth 0 at the limit.
+            trunc_only = truncated & ~terminated
+            if trunc_only.any():
+                term_obs = np.stack([
+                    infos[i]["terminal_obs"] for i in np.where(trunc_only)[0]
+                ]).astype(np.float32)
+                with torch.no_grad():
+                    v_term = self.ac.get_value(
+                        torch.as_tensor(term_obs, device=self.device)
+                    ).squeeze(-1).cpu().numpy()
+                rewards = rewards.copy()
+                rewards[trunc_only] += self.cfg["gamma"] * v_term
 
             self.buffer.add(
                 obs      = self._obs,
@@ -301,6 +336,7 @@ class PPOTrainer:
 
         self.buffer.compute_returns_and_advantages(last_values, self._dones)
         self._ep_returns = ep_returns
+        self._ep_lengths = ep_lengths
 
     # ─── Policy update ────────────────────────────────────────────────────
 
@@ -369,6 +405,7 @@ class PPOTrainer:
         }
         if self._ep_returns:
             metrics["mean_ep_return"] = np.mean(self._ep_returns)
+            metrics["mean_ep_len"]    = np.mean(self._ep_lengths)
             metrics["n_episodes"]     = len(self._ep_returns)
 
         return metrics
@@ -386,8 +423,44 @@ class PPOTrainer:
 
     def load(self, path: str) -> None:
         state = self.checkpoint.load(path)
-        self.ac.load_state_dict(state["ac_state"])
-        self.optimizer.load_state_dict(state["optimizer_state"])
+        src_dict = state["ac_state"]
+        tgt_dict = self.ac.state_dict()
+
+        src_in = src_dict["actor.net.0.weight"].shape[1]
+        tgt_in = tgt_dict["actor.net.0.weight"].shape[1]
+
+        if src_in == tgt_in:
+            self.ac.load_state_dict(src_dict)
+            try:
+                self.optimizer.load_state_dict(state["optimizer_state"])
+            except Exception as e:
+                print(f"[PPO] Optimizer state could not be loaded ({e}), starting with fresh optimizer")
+        elif src_in % 82 == 0 and tgt_in % 84 == 0 and (src_in // 82 == tgt_in // 84):
+            # Transfer learning from no-gait model to gait model (e.g. 246 -> 252)
+            h_len = src_in // 82
+            new_dict = tgt_dict.copy()
+            for k in ["actor.net.0.weight", "critic.net.0.weight"]:
+                W_new = torch.zeros_like(new_dict[k])
+                W_old = src_dict[k]
+                for h in range(h_len):
+                    W_new[:, h*84 : h*84+82] = W_old[:, h*82 : (h+1)*82]
+                new_dict[k] = W_new
+
+            for k in ["obs_mean", "obs_var"]:
+                v_new = new_dict[k].clone()
+                v_old = src_dict[k]
+                for h in range(h_len):
+                    v_new[h*84 : h*84+82] = v_old[h*82 : (h+1)*82]
+                new_dict[k] = v_new
+
+            for k, v in src_dict.items():
+                if k not in ["actor.net.0.weight", "critic.net.0.weight", "obs_mean", "obs_var"]:
+                    new_dict[k] = v
+            self.ac.load_state_dict(new_dict)
+            print(f"[PPO] Successfully transferred policy weights: obs_dim {src_in} -> {tgt_in} (preserving balance base features)")
+        else:
+            raise RuntimeError(f"Cannot load checkpoint with obs_dim {src_in} into model with obs_dim {tgt_in}")
+
         self.global_step  = state.get("global_step", 0)
         self.update_count = state.get("update_count", 0)
         print(f"[PPO] Loaded checkpoint: step={self.global_step:,}")

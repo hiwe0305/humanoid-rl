@@ -21,9 +21,11 @@ class WalkTask:
             "vertical_vel_weight": 0.0,
         },
         "stability": {
-            "upright_weight":   2.0,    # giảm một chút — gait reward đã xử lý balance
+            "upright_weight":   2.0,
+            "orientation_weight":  3.0,
+            "angular_vel_penalty": 1.0,
             "alive_bonus":      0.5,
-            "min_torso_height": 0.3,
+            "min_torso_height": 0.6,
         },
         "energy": {
             "torque_penalty":      0.0001,

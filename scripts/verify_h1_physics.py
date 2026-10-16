@@ -68,7 +68,7 @@ def test_initial_config():
     results.append(torso_ok)
 
     # Check observation valid
-    obs_ok = not np.any(np.isnan(obs)) and obs.shape[0] == 74
+    obs_ok = not np.any(np.isnan(obs)) and obs.shape[0] == env.observation_space.shape[0]
     print(f"  Obs dim = {obs.shape[0]}, NaN = {np.any(np.isnan(obs))}")
     print(f"  Observation valid: {PASS if obs_ok else FAIL}")
     results.append(obs_ok)
@@ -274,8 +274,9 @@ def test_contact_forces():
 
     obs, _ = env.reset(seed=0)
 
-    # Wait 3 steps for feet to settle onto floor
-    for _ in range(3):
+    # Wait for feet to load (force ~= body weight at ~8 steps; with zero
+    # action the robot starts toppling afterwards, so don't wait longer)
+    for _ in range(8):
         obs, _, _, _, info = env.step(np.zeros(19))
 
     contacts = info["foot_contacts"]
@@ -345,7 +346,7 @@ def test_task_init():
 
             # Quick sanity check
             ok = (
-                obs.shape[0] == 74
+                obs.shape[0] == env.observation_space.shape[0]
                 and not np.any(np.isnan(obs))
                 and info["torso_height"] > 0.5
             )

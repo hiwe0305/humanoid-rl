@@ -1,24 +1,27 @@
 """
 scripts/train_curriculum.py
 Curriculum training cho Unitree H1 / generic humanoid.
-Auto-progression: STAND → SLOW WALK → WALK → GAIT → ROUGH TERRAIN.
+Auto-progression: STAND -> SLOW WALK -> WALK -> GAIT -> ROUGH TERRAIN.
 
 Usage:
     source venv/bin/activate
-    PYTHONPATH=. MUJOCO_GL=egl python scripts/train_curriculum.py
+    PYTHONPATH=. python scripts/train_curriculum.py
 
-    # Dùng generic humanoid thay vì H1:
-    PYTHONPATH=. MUJOCO_GL=egl python scripts/train_curriculum.py --robot humanoid
+    # Show MuJoCo GUI during training (env 0):
+    PYTHONPATH=. python scripts/train_curriculum.py --render
 
-    # Resume từ checkpoint:
-    PYTHONPATH=. MUJOCO_GL=egl python scripts/train_curriculum.py \\
+    # Dung generic humanoid thay vi H1:
+    PYTHONPATH=. python scripts/train_curriculum.py --robot humanoid
+
+    # Resume tu checkpoint:
+    PYTHONPATH=. python scripts/train_curriculum.py \\
         --resume runs/curriculum/checkpoints/checkpoint_step_100.pt
 
-    # Chỉ chạy từ phase cụ thể:
-    PYTHONPATH=. MUJOCO_GL=egl python scripts/train_curriculum.py --start-phase 2
+    # Chi chay tu phase cu the:
+    PYTHONPATH=. python scripts/train_curriculum.py --start-phase 2
 
-    # Override curriculum (chạy 1 task duy nhất):
-    PYTHONPATH=. MUJOCO_GL=egl python scripts/train_curriculum.py --single-task walk
+    # Override curriculum (chay 1 task duy nhat):
+    PYTHONPATH=. python scripts/train_curriculum.py --single-task walk
 """
 
 from __future__ import annotations
@@ -44,10 +47,21 @@ def make_h1_env(task_cfg, domain_rand=False, push_rand=False, gait_rewards=False
     }
     def env_fn():
         return H1Env(
-            task_cfg=task_cfg, terrain_type="flat",
+            task_cfg=task_cfg,
             domain_rand_cfg=DOMAIN_RAND_CFG if domain_rand else None,
             push_rand_cfg=PUSH_RAND_CFG if push_rand else None,
-            frame_skip=10, history_len=3,  # multi-frame obs
+            frame_skip=10, history_len=3,
+        )
+    return env_fn
+
+def make_h1_render_env(task_cfg):
+    """Single env with MuJoCo viewer for live visualization."""
+    from humanoid_rl.envs.mujoco.h1_env import H1Env
+    def env_fn():
+        return H1Env(
+            task_cfg=task_cfg,
+            render_mode="human",
+            frame_skip=10, history_len=3,
         )
     return env_fn
 
@@ -73,6 +87,19 @@ def make_humanoid_env(task_cfg, domain_rand=False, push_rand=False, gait_rewards
         )
     return env_fn
 
+def make_humanoid_render_env(task_cfg):
+    """Single env with MuJoCo viewer for live visualization."""
+    from humanoid_rl.envs.mujoco.humanoid_loco import MuJoCoHumanoidEnv
+    from humanoid_rl.robots.mujoco_humanoid import get_humanoid_cfg
+    robot_cfg = get_humanoid_cfg()
+    def env_fn():
+        return MuJoCoHumanoidEnv(
+            robot_cfg=robot_cfg, task_cfg=task_cfg, terrain_type="flat",
+            render_mode="human",
+            frame_skip=5, history_len=3,
+        )
+    return env_fn
+
 
 def create_task_cfg(phase: dict) -> dict:
     """Build task config dict from phase config."""
@@ -90,7 +117,6 @@ def create_task_cfg(phase: dict) -> dict:
             terrain=phase["terrain"],
         )
         cfg = task.to_cfg()
-        # Enable/disable gait rewards
         if not phase["gait_rewards"]:
             cfg["rewards"].pop("gait", None)
     else:
@@ -112,6 +138,8 @@ def train_curriculum():
                         help="Run single task instead of full curriculum: stand / walk")
     parser.add_argument("--log-dir", default="runs/curriculum")
     parser.add_argument("--device", default=None)
+    parser.add_argument("--render", action="store_true",
+                        help="Show MuJoCo viewer during training (env 0)")
     args = parser.parse_args()
 
     # Device
@@ -135,9 +163,11 @@ def train_curriculum():
 
     from humanoid_rl.algorithms.ppo.ppo import PPOTrainer
 
+    render_flag = "--render" if args.render else ""
     print("=" * 60)
-    print(f"  Curriculum Training — Robot: {args.robot}")
+    print(f"  Curriculum Training -- Robot: {args.robot}")
     print(f"  Device: {device}  |  n_envs: {args.n_envs}")
+    print(f"  Render: {'ON (MuJoCo viewer)' if args.render else 'OFF'}")
     print(f"  Log:    {args.log_dir}")
     if args.resume:
         print(f"  Resume: {args.resume}")
@@ -167,7 +197,7 @@ def train_curriculum():
 
         task_cfg = create_task_cfg(phase)
 
-        # Create env factory
+        # Create env factory (headless for vec envs)
         if args.robot == "h1":
             env_fn = make_h1_env(
                 task_cfg,
@@ -175,6 +205,7 @@ def train_curriculum():
                 push_rand=phase["push_rand"],
                 gait_rewards=phase["gait_rewards"],
             )
+            render_env_fn = make_h1_render_env(task_cfg) if args.render else None
         else:
             env_fn = make_humanoid_env(
                 task_cfg,
@@ -182,6 +213,7 @@ def train_curriculum():
                 push_rand=phase["push_rand"],
                 gait_rewards=phase["gait_rewards"],
             )
+            render_env_fn = make_humanoid_render_env(task_cfg) if args.render else None
 
         # PPO config
         ppo_cfg = {
@@ -192,24 +224,26 @@ def train_curriculum():
             "gamma": 0.99,
             "gae_lambda": 0.95,
             "clip_coef": 0.2,
-            "clip_value": True,
+            "clip_value": False,
             "value_coef": 0.5,
             "entropy_coef": phase.get("entropy_coef", 0.01),
             "lr": phase["lr"],
             "max_grad_norm": 0.5,
             "lr_anneal": True,
+            "normalize_reward": True,
             "total_steps": phase["total_steps"],
             "save_every": 20,
             "actor_hidden": [512, 256, 128],
             "critic_hidden": [512, 256, 128],
         }
 
-        # Create trainer
+        # Create trainer (pass render_env_fn for live viewer)
         trainer = PPOTrainer(
             env_fn=env_fn,
             cfg=ppo_cfg,
             device=device,
             log_dir=str(Path(args.log_dir) / f"phase_{curriculum.phase_index}_{phase['name'].lower().replace(' ','_')}"),
+            render_env_fn=render_env_fn,
         )
 
         # Resume checkpoint if provided
@@ -224,10 +258,8 @@ def train_curriculum():
         def curriculum_aware_log(metrics, step):
             nonlocal curriculum, trainer, original_log
             original_log(metrics, step)
-            # Check curriculum advance
             result = curriculum.step(metrics)
             if result is not None:
-                # Phase transition — save checkpoint
                 trainer.save(f"phase_{curriculum.phase_index-1}_done")
                 print(f"  Phase {curriculum.phase_index-1} done. Saving checkpoint.")
         trainer.logger.log = curriculum_aware_log
@@ -238,18 +270,15 @@ def train_curriculum():
         # Save phase checkpoint
         trainer.save(f"phase_{curriculum.phase_index}_final")
 
-        # Check if curriculum advanced during training
-        # (if not, manually advance after training steps complete)
         if curriculum.current_phase == phase:
             print(f"  Phase {curriculum.phase_index}: steps completed, advancing...")
             curriculum._advance()
 
-        # Clear resume so we don't reload on next phase
         args.resume = None
 
     elapsed = time.time() - t_start
     print(f"\n{'='*60}")
-    print(f"  ✅ Curriculum training complete!")
+    print(f"  Curriculum training complete!")
     print(f"  Total time: {elapsed/3600:.1f}h")
     print(f"  Final checkpoint: {Path(args.log_dir) / 'checkpoints' / 'checkpoint_final.pt'}")
     print(f"{'='*60}")

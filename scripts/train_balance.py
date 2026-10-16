@@ -26,7 +26,7 @@ def make_env(task_cfg: dict, render_mode: str | None = None):
     from humanoid_rl.envs.mujoco.h1_env import H1Env
     def env_fn():
         return H1Env(
-            task_cfg=task_cfg, terrain_type="flat",
+            task_cfg=task_cfg,
             domain_rand_cfg=None, push_rand_cfg=None,
             render_mode=render_mode, frame_skip=10, history_len=3,
         )
@@ -50,15 +50,27 @@ def train_balance():
 
     from humanoid_rl.envs.mujoco.tasks.stand_task import StandTask
     task_cfg = StandTask().to_cfg()
-    render_mode = "human" if args.render else None
+    render_mode = None  # vec envs use offscreen rendering
+    render_env_fn = None
+    if args.render:
+        # Create one interactive MuJoCo viewer env alongside training
+        def make_render_env():
+            from humanoid_rl.envs.mujoco.h1_env import H1Env
+            return H1Env(
+                task_cfg=task_cfg,
+                domain_rand_cfg=None, push_rand_cfg=None,
+                render_mode="human", frame_skip=10, history_len=3,
+            )
+        render_env_fn = make_render_env
+        print("[Render] Interactive MuJoCo viewer enabled (env 0)")
     env_fn = make_env(task_cfg, render_mode)
 
     ppo_cfg = {
         "n_envs": args.n_envs, "n_steps": 512, "batch_size": 1024,
         "n_epochs": 5, "gamma": 0.99, "gae_lambda": 0.95,
-        "clip_coef": 0.2, "clip_value": True, "value_coef": 0.5,
+        "clip_coef": 0.2, "clip_value": False, "value_coef": 0.5,
         "entropy_coef": 0.01, "lr": 3e-4, "max_grad_norm": 0.5,
-        "lr_anneal": True, "total_steps": args.total_steps, "save_every": 20,
+        "lr_anneal": True, "normalize_reward": True, "total_steps": args.total_steps, "save_every": 20,
         "actor_hidden": [512, 256, 128], "critic_hidden": [512, 256, 128],
         "record_video": args.record_video, "record_every": 50, "robot_name": "h1",
     }
@@ -75,7 +87,8 @@ def train_balance():
         print(f"  Video:   every 50 updates")
     print("=" * 60)
 
-    trainer = PPOTrainer(env_fn=env_fn, cfg=ppo_cfg, device=device, log_dir=args.log_dir)
+    trainer = PPOTrainer(env_fn=env_fn, cfg=ppo_cfg, device=device, log_dir=args.log_dir,
+                         render_env_fn=render_env_fn)
 
     if args.resume:
         ckpt = Path(args.resume)
